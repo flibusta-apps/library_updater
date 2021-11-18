@@ -1,0 +1,6 @@
+fastapi
+pydantic[dotenv]
+asyncpg
+aiomysql
+uvicorn[standart]
+aiologger
