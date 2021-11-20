@@ -16,5 +16,7 @@ class EnvConfig(BaseSettings):
     MYSQL_USER: str
     MYSQL_PASSWORD: str
 
+    FL_BASE_URL: str
+
 
 env_config = EnvConfig()

@@ -28,7 +28,7 @@ def remove_dots(s: str):
     return s.replace('.', '')
 
 
-class FlibustaUpdater(BaseUpdater):
+class FlUpdater(BaseUpdater):
     SOURCE: int
 
     FILES = [
@@ -83,7 +83,7 @@ class FlibustaUpdater(BaseUpdater):
 
     async def _import_dump(self, filename: str):
         result = await run(
-            f"wget -O - http://flibusta.is/sql/{filename}.gz | gunzip | "
+            f"wget -O - {env_config.FL_BASE_URL}/sql/{filename}.gz | gunzip | "
             f"mysql -h {env_config.MYSQL_HOST} -u {env_config.MYSQL_USER} "
             f"-p\"{env_config.MYSQL_PASSWORD}\" {env_config.MYSQL_DB_NAME}"
         )
