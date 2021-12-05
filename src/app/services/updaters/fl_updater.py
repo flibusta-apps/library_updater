@@ -146,7 +146,7 @@ class FlUpdater(BaseUpdater):
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    "SELECT AvtorId, FirstName, MiddleName, LastName FROM libavtorname;"
+                    "SELECT AvtorId, FirstName, LastName, MiddleName FROM libavtorname;"
                 )
 
                 while (rows := await cursor.fetchmany(32)):
