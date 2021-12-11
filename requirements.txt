@@ -4,3 +4,4 @@ asyncpg
 aiomysql
 uvicorn[standart]
 aiologger
+httpx

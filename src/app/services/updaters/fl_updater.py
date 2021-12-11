@@ -8,6 +8,7 @@ from aiologger import Logger
 
 from core.config import env_config
 from app.services.updaters.base import BaseUpdater
+from app.services.webhook import WebhookSender
 
 
 async def run(cmd) -> tuple[bytes, bytes, Optional[int]]:
@@ -473,6 +474,8 @@ class FlUpdater(BaseUpdater):
             self._update_genres(),
             self._update_books_genres()
         )
+
+        await WebhookSender.send()
 
         return True
 
