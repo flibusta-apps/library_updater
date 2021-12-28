@@ -164,12 +164,22 @@ class FlUpdater(BaseUpdater):
         await self.log("Authors updated!")
 
     async def _update_books(self):
+        replace_dict = {
+            "ru-": "ru",
+            "ru~": "ru"
+        }
+
+        def fix_lang(lang: str) -> str:
+            lower_lang = lang.lower()
+            replaced_lang = replace_dict.get(lower_lang, lower_lang)
+            return replaced_lang
+
         def prepare_book(row: list):
             return [
                 self.SOURCE,
                 row[0],
                 remove_wrong_ch(row[1]),
-                row[2],
+                fix_lang(row[2]),
                 row[3],
                 row[4],
                 row[5] == '1'
