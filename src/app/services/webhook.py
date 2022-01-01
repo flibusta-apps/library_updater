@@ -7,7 +7,7 @@ class WebhookSender:
     @classmethod
     async def _make_request(cls, webhook: WebhookConfig):
         async with httpx.AsyncClient() as client:
-            request_maker= getattr(client, webhook.method)
+            request_maker = getattr(client, webhook.method)
             await request_maker(webhook.url, headers=webhook.headers)
 
     @classmethod

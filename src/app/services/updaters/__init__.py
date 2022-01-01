@@ -5,9 +5,7 @@ from app.services.updaters.fl_updater import FlUpdater
 
 
 class UpdaterTypes(Enum):
-    FL = 'fl'
+    FL = "fl"
 
 
-UPDATERS: dict[UpdaterTypes, BaseUpdater] = {
-    UpdaterTypes.FL: FlUpdater
-}
+UPDATERS: dict[UpdaterTypes, BaseUpdater] = {UpdaterTypes.FL: FlUpdater}

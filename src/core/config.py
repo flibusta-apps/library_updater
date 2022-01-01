@@ -1,9 +1,10 @@
 from typing import Optional, Union, Literal
+
 from pydantic import BaseModel, BaseSettings
 
 
 class WebhookConfig(BaseModel):
-    method: Union[Literal['get'], Literal['post']]
+    method: Union[Literal["get"], Literal["post"]]
     url: str
     headers: dict[str, str]
 
