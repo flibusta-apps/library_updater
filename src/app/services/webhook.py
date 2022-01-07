@@ -6,6 +6,8 @@ from core.config import env_config, WebhookConfig
 class WebhookSender:
     @classmethod
     async def _make_request(cls, webhook: WebhookConfig):
+        print(f"Make request to {webhook.url}")
+
         async with httpx.AsyncClient() as client:
             request_maker = getattr(client, webhook.method)
             await request_maker(webhook.url, headers=webhook.headers)
