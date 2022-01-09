@@ -6,7 +6,6 @@ import aiomysql
 import asyncpg
 
 from app.services.updaters.base import BaseUpdater
-from app.services.webhook import WebhookSender
 from core.config import env_config
 
 
@@ -704,8 +703,6 @@ class FlUpdater(BaseUpdater):
             self._update_genres(),
             self._update_books_genres(),
         )
-
-        await WebhookSender.send()
 
         return True
 

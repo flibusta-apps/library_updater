@@ -1,4 +1,4 @@
-from typing import Optional, Union, Literal
+from typing import Union, Literal
 
 from pydantic import BaseModel, BaseSettings
 
@@ -25,8 +25,6 @@ class EnvConfig(BaseSettings):
     MYSQL_PASSWORD: str
 
     FL_BASE_URL: str
-
-    WEBHOOKS: Optional[list[WebhookConfig]]
 
 
 env_config = EnvConfig()
