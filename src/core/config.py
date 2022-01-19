@@ -24,6 +24,10 @@ class EnvConfig(BaseSettings):
     MYSQL_USER: str
     MYSQL_PASSWORD: str
 
+    REDIS_HOST: str
+    REDIS_PORT: int
+    REDIS_DB: int
+
     FL_BASE_URL: str
 
 

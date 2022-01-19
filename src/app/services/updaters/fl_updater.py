@@ -1,12 +1,15 @@
 import asyncio
+from logging import Logger
 from typing import Optional
 
-from aiologger import Logger
 import aiomysql
+from arq.connections import ArqRedis
 import asyncpg
 
-from app.services.updaters.base import BaseUpdater
 from core.config import env_config
+
+
+logger = Logger("fl_updater")
 
 
 async def run(cmd) -> tuple[bytes, bytes, Optional[int]]:
@@ -26,7 +29,7 @@ def remove_dots(s: str):
     return s.replace(".", "")
 
 
-class FlUpdater(BaseUpdater):
+class FlUpdater:
     SOURCE: int
 
     FILES = [
@@ -52,15 +55,13 @@ class FlUpdater(BaseUpdater):
     sequences_updated_event: asyncio.Event
     genres_updated_event: asyncio.Event
 
-    logger: Logger
-
     async def _import_dump(self, filename: str):
         await run(
             f"wget -O - {env_config.FL_BASE_URL}/sql/{filename}.gz | gunzip | "
             f"mysql -h {env_config.MYSQL_HOST} -u {env_config.MYSQL_USER} "
             f'-p"{env_config.MYSQL_PASSWORD}" {env_config.MYSQL_DB_NAME}'
         )
-        await self.logger.info(f"Imported {filename}")
+        logger.info(f"Imported {filename}")
 
     async def _prepare(self):
         posgres_pool = await asyncpg.create_pool(
@@ -85,7 +86,7 @@ class FlUpdater(BaseUpdater):
         self.postgres_pool = posgres_pool
 
     async def _set_source(self):
-        await self.logger.info("Set source...")
+        logger.info("Set source...")
 
         source_row = await self.postgres_pool.fetchrow(
             "SELECT id FROM sources WHERE name = 'flibusta';"
@@ -102,7 +103,7 @@ class FlUpdater(BaseUpdater):
 
         self.SOURCE = source_row["id"]
 
-        await self.logger.info("Source has set!")
+        logger.info("Source has set!")
 
     async def _update_authors(self):
         def prepare_author(row: list):
@@ -114,7 +115,7 @@ class FlUpdater(BaseUpdater):
                 remove_wrong_ch(row[3]),
             ]
 
-        await self.logger.info("Update authors...")
+        logger.info("Update authors...")
 
         await self.postgres_pool.execute(
             """
@@ -157,7 +158,7 @@ class FlUpdater(BaseUpdater):
 
         self.authors_updated_event.set()
 
-        await self.logger.info("Authors updated!")
+        logger.info("Authors updated!")
 
     async def _update_books(self):
         replace_dict = {"ru-": "ru", "ru~": "ru"}
@@ -178,7 +179,7 @@ class FlUpdater(BaseUpdater):
                 row[5] == "1",
             ]
 
-        await self.logger.info("Update books...")
+        logger.info("Update books...")
 
         await self.postgres_pool.execute(
             """
@@ -223,13 +224,13 @@ class FlUpdater(BaseUpdater):
 
         self.books_updated_event.set()
 
-        await self.logger.info("Books updated!")
+        logger.info("Books updated!")
 
     async def _update_books_authors(self):
         await self.books_updated_event.wait()
         await self.authors_updated_event.wait()
 
-        await self.logger.info("Update books_authors...")
+        logger.info("Update books_authors...")
 
         await self.postgres_pool.execute(
             """
@@ -271,13 +272,13 @@ class FlUpdater(BaseUpdater):
                         [(self.SOURCE, *row) for row in rows],
                     )
 
-        await self.logger.info("Books_authors updated!")
+        logger.info("Books_authors updated!")
 
     async def _update_translations(self):
         await self.books_updated_event.wait()
         await self.authors_updated_event.wait()
 
-        await self.logger.info("Update translations...")
+        logger.info("Update translations...")
 
         await self.postgres_pool.execute(
             """
@@ -324,7 +325,7 @@ class FlUpdater(BaseUpdater):
                         [(self.SOURCE, *row) for row in rows],
                     )
 
-        await self.logger.info("Translations updated!")
+        logger.info("Translations updated!")
 
     async def _update_sequences(self):
         def prepare_sequence(row: list):
@@ -334,7 +335,7 @@ class FlUpdater(BaseUpdater):
                 remove_wrong_ch(row[1]),
             ]
 
-        await self.logger.info("Update sequences...")
+        logger.info("Update sequences...")
 
         await self.postgres_pool.execute(
             """
@@ -373,13 +374,13 @@ class FlUpdater(BaseUpdater):
 
         self.sequences_updated_event.set()
 
-        await self.logger.info("Sequences updated!")
+        logger.info("Sequences updated!")
 
     async def _update_sequences_info(self):
         await self.sequences_updated_event.wait()
         await self.books_updated_event.wait()
 
-        await self.logger.info("Update book_sequences...")
+        logger.info("Update book_sequences...")
 
         await self.postgres_pool.execute(
             """
@@ -429,12 +430,12 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Book_sequences updated!")
+        logger.info("Book_sequences updated!")
 
     async def _update_book_annotations(self):
         await self.books_updated_event.wait()
 
-        await self.logger.info("Update book_annotations...")
+        logger.info("Update book_annotations...")
 
         await self.postgres_pool.execute(
             """
@@ -478,12 +479,12 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Book_annotations updated!")
+        logger.info("Book_annotations updated!")
 
         await self._update_book_annotations_pic()
 
     async def _update_book_annotations_pic(self):
-        await self.logger.info("Update book_annotations_pic...")
+        logger.info("Update book_annotations_pic...")
 
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -508,12 +509,12 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Book_annotation_pics updated!")
+        logger.info("Book_annotation_pics updated!")
 
     async def _update_author_annotations(self):
         await self.authors_updated_event.wait()
 
-        await self.logger.info("Update author_annotations...")
+        logger.info("Update author_annotations...")
 
         await self.postgres_pool.execute(
             """
@@ -554,12 +555,12 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Author_annotation_updated!")
+        logger.info("Author_annotation_updated!")
 
         await self._update_author_annotations_pics()
 
     async def _update_author_annotations_pics(self):
-        await self.logger.info("Update author_annotations_pic...")
+        logger.info("Update author_annotations_pic...")
 
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -584,10 +585,10 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Author_annotatioins_pic updated!")
+        logger.info("Author_annotatioins_pic updated!")
 
     async def _update_genres(self):
-        await self.logger.info("Update genres...")
+        logger.info("Update genres...")
 
         await self.postgres_pool.execute(
             """
@@ -627,13 +628,13 @@ class FlUpdater(BaseUpdater):
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        await self.logger.info("Genres updated!")
+        logger.info("Genres updated!")
 
     async def _update_books_genres(self):
         await self.books_updated_event.wait()
         await self.genres_updated_event.wait()
 
-        await self.logger.info("Update book_genres...")
+        logger.info("Update book_genres...")
 
         await self.postgres_pool.execute(
             """
@@ -675,14 +676,18 @@ class FlUpdater(BaseUpdater):
                         [(self.SOURCE, *row) for row in rows],
                     )
 
-        await self.logger.info("Book_genres updated!")
+        logger.info("Book_genres updated!")
 
-    async def _update(self) -> bool:
-        self.logger = Logger.with_default_handlers()
-
-        await self._prepare()
-
+    async def _import(self, ctx) -> bool:
         await asyncio.gather(*[self._import_dump(filename) for filename in self.FILES])
+
+        arq_pool: ArqRedis = ctx["arq_pool"]
+        await arq_pool.enqueue_job("run_fl_update2")
+
+        return True
+
+    async def _update(self, ctx) -> bool:
+        await self._prepare()
 
         await self._set_source()
 
@@ -706,7 +711,10 @@ class FlUpdater(BaseUpdater):
 
         return True
 
-    @classmethod
-    async def update(cls) -> bool:
-        updater = cls()
-        return await updater._update()
+
+async def run_fl_update(ctx) -> bool:
+    return await FlUpdater()._import(ctx)
+
+
+async def run_fl_update2(ctx) -> bool:
+    return await FlUpdater()._update(ctx)
