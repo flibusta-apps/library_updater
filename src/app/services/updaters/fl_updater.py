@@ -1,5 +1,5 @@
 import asyncio
-from logging import Logger
+import logging
 from typing import Optional
 
 import aiomysql
@@ -9,7 +9,13 @@ import asyncpg
 from core.config import env_config
 
 
-logger = Logger("fl_updater")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+
+logger.addHandler(ch)
 
 
 async def run(cmd) -> tuple[bytes, bytes, Optional[int]]:
@@ -27,6 +33,26 @@ def remove_wrong_ch(s: str):
 
 def remove_dots(s: str):
     return s.replace(".", "")
+
+
+def fix_annotation_text(text: str) -> str:
+    replace_map = {
+        "<p class=book>": "",
+        '<p class="book">': "",
+        "<p>": "",
+        "</p>": "",
+        "&nbsp;": "",
+        "[b]": "",
+        "[/b]": "",
+        "[hr]": "",
+    }
+
+    t = text
+
+    for key, value in replace_map:
+        t = t.replace(key, value)
+
+    return t
 
 
 class FlUpdater:
@@ -461,7 +487,7 @@ class FlUpdater:
                 self.SOURCE,
                 row[0],
                 row[1],
-                row[2].lstrip("<p class=book>").rstrip("</p>"),
+                fix_annotation_text(row[2]),
             ]
 
         async with self.mysql_pool.acquire() as conn:
@@ -543,6 +569,14 @@ class FlUpdater:
         """
         )
 
+        def fix_annotation(row) -> list:
+            return [
+                self.SOURCE,
+                row[0],
+                row[1],
+                fix_annotation_text(row[2]),
+            ]
+
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT COUNT(*) FROM libaannotations;")
@@ -560,7 +594,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_author_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                        [[self.SOURCE, *row] for row in rows],
+                        [fix_annotation(row) for row in rows],
                     )
 
         logger.info("Author_annotation_updated!")
