@@ -456,6 +456,14 @@ class FlUpdater:
         """
         )
 
+        def fix_annotation(row) -> list:
+            return [
+                self.SOURCE,
+                row[0],
+                row[1],
+                row[2].lstrip("<p class=book>").rstrip("</p>"),
+            ]
+
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
@@ -476,7 +484,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                        [[self.SOURCE, *row] for row in rows],
+                        [fix_annotation(row) for row in rows],
                     )
 
         logger.info("Book_annotations updated!")
