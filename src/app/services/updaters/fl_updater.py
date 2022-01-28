@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import Optional
 
 import aiomysql
@@ -35,22 +36,21 @@ def remove_dots(s: str):
     return s.replace(".", "")
 
 
+tags_regexp = re.compile(r"<.*?>")
+
+
 def fix_annotation_text(text: str) -> str:
     replace_map = {
-        "<p class=book>": "",
-        '<p class="book">': "",
-        "<p>": "",
-        "</p>": "",
         "&nbsp;": "",
         "[b]": "",
         "[/b]": "",
         "[hr]": "",
     }
 
-    t = text
+    t = tags_regexp.sub("", text)
 
-    for key, value in replace_map:
-        t = t.replace(key, value)
+    for key in replace_map:
+        t = t.replace(key, replace_map[key])
 
     return t
 
@@ -236,7 +236,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT BookId, Title, Lang, FileType, Time, Deleted FROM libbook LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT BookId, Title, Lang, FileType, Time, Deleted FROM libbook ORDER BY BookId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -280,13 +280,13 @@ class FlUpdater:
 
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute("SELECT COUNT(*) FROM libavtorname;")
+                await cursor.execute("SELECT COUNT(*) FROM libavtor;")
 
                 (rows_count,) = await cursor.fetchone()
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT BookId, AvtorId FROM libavtor LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT BookId, AvtorId FROM libavtor ORDER BY BookId, AvtorId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -298,7 +298,7 @@ class FlUpdater:
                         [(self.SOURCE, *row) for row in rows],
                     )
 
-        logger.info("Books_authors updated!")
+        logger.info("Books authors updated!")
 
     async def _update_translations(self):
         await self.books_updated_event.wait()
@@ -456,7 +456,7 @@ class FlUpdater:
                         [[self.SOURCE, *row] for row in rows],
                     )
 
-        logger.info("Book_sequences updated!")
+        logger.info("Book sequences updated!")
 
     async def _update_book_annotations(self):
         await self.books_updated_event.wait()
@@ -520,6 +520,9 @@ class FlUpdater:
     async def _update_book_annotations_pic(self):
         logger.info("Update book_annotations_pic...")
 
+        def fix_link(row):
+            return [self.SOURCE, row[0], f"{env_config.FL_BASE_URL}/i/{row[1]}"]
+
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT COUNT(*) FROM libbpics;")
@@ -540,10 +543,10 @@ class FlUpdater:
                         "SET file = cast($3 as varchar) "
                         "FROM (SELECT id FROM books WHERE source = $1 AND remote_id = $2) as books "
                         "WHERE book = books.id;",
-                        [[self.SOURCE, *row] for row in rows],
+                        [fix_link(row) for row in rows],
                     )
 
-        logger.info("Book_annotation_pics updated!")
+        logger.info("Book annotation pics updated!")
 
     async def _update_author_annotations(self):
         await self.authors_updated_event.wait()
@@ -597,12 +600,15 @@ class FlUpdater:
                         [fix_annotation(row) for row in rows],
                     )
 
-        logger.info("Author_annotation_updated!")
+        logger.info("Author annotation updated!")
 
         await self._update_author_annotations_pics()
 
     async def _update_author_annotations_pics(self):
         logger.info("Update author_annotations_pic...")
+
+        def fix_link(row):
+            return [self.SOURCE, row[0], f"{env_config.FL_BASE_URL}/ia/{row[1]}"]
 
         async with self.mysql_pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -624,10 +630,10 @@ class FlUpdater:
                         "SET file = cast($3 as varchar) "
                         "FROM (SELECT id FROM authors WHERE source = $1 AND remote_id = $2) as authors "
                         "WHERE author = authors.id;",
-                        [[self.SOURCE, *row] for row in rows],
+                        [fix_link(row) for row in rows],
                     )
 
-        logger.info("Author_annotatioins_pic updated!")
+        logger.info("Author annotatioins pic updated!")
 
     async def _update_genres(self):
         logger.info("Update genres...")
@@ -669,6 +675,8 @@ class FlUpdater:
                         "SELECT update_genre($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
                         [[self.SOURCE, *row] for row in rows],
                     )
+
+        self.genres_updated_event.set()
 
         logger.info("Genres updated!")
 
