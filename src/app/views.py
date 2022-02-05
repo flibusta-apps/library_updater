@@ -15,3 +15,8 @@ async def update(request: Request, updater: UpdaterTypes):
     await arq_pool.enqueue_job(UPDATERS[updater])
 
     return "Ok!"
+
+
+@router.get("/healthcheck")
+async def healthcheck():
+    return "Ok!"
