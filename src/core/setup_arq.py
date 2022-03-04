@@ -11,4 +11,4 @@ class WorkerSettings:
     on_startup = startup
     redis_settings = get_redis_settings()
     max_jobs = 1
-    job_timeout = 15 * 60
+    job_timeout = 30 * 60
