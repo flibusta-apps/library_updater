@@ -179,7 +179,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_author($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-                        [prepare_author(row) for row in rows],
+                        (prepare_author(row) for row in rows),
                     )
 
         self.authors_updated_event.set()
@@ -245,7 +245,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7);",
-                        [prepare_book(row) for row in rows],
+                        (prepare_book(row) for row in rows),
                     )
 
         self.books_updated_event.set()
@@ -295,7 +295,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book_author($1, $2, $3);",
-                        [(self.SOURCE, *row) for row in rows],
+                        ((self.SOURCE, *row) for row in rows),
                     )
 
         logger.info("Books authors updated!")
@@ -348,7 +348,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_translation($1, $2, $3, $4)",
-                        [(self.SOURCE, *row) for row in rows],
+                        ((self.SOURCE, *row) for row in rows),
                     )
 
         logger.info("Translations updated!")
@@ -395,7 +395,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_sequences($1, $2, cast($3 as varchar));",
-                        [prepare_sequence(row) for row in rows],
+                        (prepare_sequence(row) for row in rows),
                     )
 
         self.sequences_updated_event.set()
@@ -453,7 +453,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book_sequence($1, $2, $3, $4);",
-                        [[self.SOURCE, *row] for row in rows],
+                        ([self.SOURCE, *row] for row in rows),
                     )
 
         logger.info("Book sequences updated!")
@@ -510,7 +510,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                        [fix_annotation(row) for row in rows],
+                        (fix_annotation(row) for row in rows),
                     )
 
         logger.info("Book_annotations updated!")
@@ -543,7 +543,7 @@ class FlUpdater:
                         "SET file = cast($3 as varchar) "
                         "FROM (SELECT id FROM books WHERE source = $1 AND remote_id = $2) as books "
                         "WHERE book = books.id;",
-                        [fix_link(row) for row in rows],
+                        (fix_link(row) for row in rows),
                     )
 
         logger.info("Book annotation pics updated!")
@@ -597,7 +597,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_author_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                        [fix_annotation(row) for row in rows],
+                        (fix_annotation(row) for row in rows),
                     )
 
         logger.info("Author annotation updated!")
@@ -630,7 +630,7 @@ class FlUpdater:
                         "SET file = cast($3 as varchar) "
                         "FROM (SELECT id FROM authors WHERE source = $1 AND remote_id = $2) as authors "
                         "WHERE author = authors.id;",
-                        [fix_link(row) for row in rows],
+                        (fix_link(row) for row in rows),
                     )
 
         logger.info("Author annotatioins pic updated!")
@@ -673,7 +673,7 @@ class FlUpdater:
                     rows = await cursor.fetchall()
                     await self.postgres_pool.executemany(
                         "SELECT update_genre($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-                        [[self.SOURCE, *row] for row in rows],
+                        ([self.SOURCE, *row] for row in rows),
                     )
 
         self.genres_updated_event.set()
@@ -723,7 +723,7 @@ class FlUpdater:
 
                     await self.postgres_pool.executemany(
                         "SELECT update_book_sequence($1, $2, $3);",
-                        [(self.SOURCE, *row) for row in rows],
+                        ((self.SOURCE, *row) for row in rows),
                     )
 
         logger.info("Book_genres updated!")
