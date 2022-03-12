@@ -762,7 +762,7 @@ class FlUpdater:
         return True
 
 
-async def run_fl_update(ctx) -> bool:
+async def run_fl_update(ctx: dict, *args, **kwargs) -> bool:
     return await FlUpdater()._import(ctx)
 
 
