@@ -170,7 +170,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT AvtorId, FirstName, LastName, MiddleName FROM libavtorname LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT AvtorId, FirstName, LastName, MiddleName FROM libavtorname ORDER BY AvtorId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -341,7 +341,9 @@ class FlUpdater:
                     await cursor.execute(
                         "SELECT BookId, TranslatorId, Pos FROM libtranslator "
                         "WHERE BookId IN (SELECT BookId FROM libbook) "
-                        "LIMIT 4096 OFFSET {offset};".format(offset=offset)
+                        "ORDER BY BookId, TranslatorId LIMIT 4096 OFFSET {offset};".format(
+                            offset=offset
+                        )
                     )
 
                     rows = await cursor.fetchall()
@@ -386,7 +388,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT SeqId, SeqName FROM libseqname LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT SeqId, SeqName FROM libseqname ORDER BY SeqId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -446,7 +448,9 @@ class FlUpdater:
                         "WHERE "
                         "BookId IN (SELECT BookId FROM libbook) AND "
                         "SeqId IN (SELECT SeqId FROM libseqname) "
-                        "LIMIT 4096 OFFSET {offset};".format(offset=offset)
+                        "ORDER BY BookId, SeqId LIMIT 4096 OFFSET {offset};".format(
+                            offset=offset
+                        )
                     )
 
                     rows = await cursor.fetchall()
@@ -503,7 +507,9 @@ class FlUpdater:
                     await cursor.execute(
                         "SELECT BookId, Title, Body FROM libbannotations "
                         "WHERE BookId IN (SELECT BookId FROM libbook) "
-                        "LIMIT 4096 OFFSET {offset};".format(offset=offset)
+                        "ORDER BY BookId LIMIT 4096 OFFSET {offset};".format(
+                            offset=offset
+                        )
                     )
 
                     rows = await cursor.fetchall()
@@ -531,7 +537,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT BookId, File FROM libbpics LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT BookId, File FROM libbpics ORDER BY BookId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -588,7 +594,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT AvtorId, Title, Body FROM libaannotations LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT AvtorId, Title, Body FROM libaannotations ORDER BY AvtorId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -618,7 +624,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT AvtorId, File FROM libapics LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT AvtorId, File FROM libapics ORDER BY AvtorId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -665,7 +671,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT GenreId, GenreCode, GenreDesc, GenreMeta FROM libgenrelist LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT GenreId, GenreCode, GenreDesc, GenreMeta FROM libgenrelist ORDER BY GenreId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
@@ -714,7 +720,7 @@ class FlUpdater:
 
                 for offset in range(0, rows_count, 4096):
                     await cursor.execute(
-                        "SELECT BookId, GenreId FROM libgenre LIMIT 4096 OFFSET {offset};".format(
+                        "SELECT BookId, GenreId FROM libgenre ORDER BY BookId, GenreId LIMIT 4096 OFFSET {offset};".format(
                             offset=offset
                         )
                     )
