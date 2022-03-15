@@ -13,7 +13,5 @@ class WorkerSettings:
     on_startup = startup
     redis_settings = get_redis_settings()
     max_jobs = 1
-    job_timeout = 30 * 60
-    cron_jobs = [
-        cron(run_fl_update, hour={5}, minute=0)
-    ]
+    job_timeout = 45 * 60
+    cron_jobs = [cron(run_fl_update, hour={5}, minute=0)]
