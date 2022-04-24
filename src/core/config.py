@@ -30,5 +30,7 @@ class EnvConfig(BaseSettings):
 
     FL_BASE_URL: str
 
+    SENTRY_DSN: str
+
 
 env_config = EnvConfig()

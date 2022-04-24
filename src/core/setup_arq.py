@@ -4,6 +4,7 @@ from arq.cron import cron
 from app.services.updaters.fl_updater import __tasks__ as fl_tasks
 from app.services.updaters.fl_updater import run_fl_update
 from core.arq_pool import get_redis_settings, get_arq_pool
+import core.sentry  # noqa: F401
 
 
 async def startup(ctx):
