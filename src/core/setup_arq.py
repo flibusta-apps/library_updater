@@ -26,4 +26,4 @@ class WorkerSettings:
     max_jobs = 2
     max_tries = 10
     job_timeout = 5 * 60
-    cron_jobs = [cron(run_fl_update, hour={3}, minute=0)]
+    cron_jobs = [cron(run_fl_update, hour={5}, minute=0)]

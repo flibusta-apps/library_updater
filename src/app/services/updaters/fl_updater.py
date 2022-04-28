@@ -7,6 +7,7 @@ import aiomysql
 from arq.connections import ArqRedis
 from arq.worker import Retry
 import asyncpg
+import httpx
 
 from app.services.updaters.utils.cmd import run_cmd
 from app.services.updaters.utils.tasks import is_jobs_complete
@@ -49,6 +50,8 @@ class JobId(Enum):
     update_author_annotations_pics = "update_fl_author_annotations_pics"
     update_genres = "update_fl_genres"
     update_books_genres = "update_fl_books_genres"
+
+    webhook = "fl_webhook"
 
 
 async def import_fl_dump(ctx: dict, filename: str, *args, **kwargs):
@@ -101,10 +104,12 @@ async def get_source(postgres: asyncpg.Connection) -> int:
 async def update_fl_authors(ctx: dict, *args, prefix: Optional[str] = None, **kwargs):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool, [JobId.import_libavtorname.value], prefix=prefix
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -156,10 +161,12 @@ async def update_fl_authors(ctx: dict, *args, prefix: Optional[str] = None, **kw
 async def update_fl_books(ctx: dict, *args, prefix: Optional[str] = None, **kwargs):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool, [JobId.import_libbook.value], prefix=prefix
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -224,7 +231,7 @@ async def update_fl_books_authors(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libavtor.value,
@@ -232,8 +239,10 @@ async def update_fl_books_authors(
             JobId.update_books.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -277,7 +286,7 @@ async def update_fl_translations(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libtranslator.value,
@@ -285,8 +294,10 @@ async def update_fl_translations(
             JobId.update_books.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -333,14 +344,16 @@ async def update_fl_translations(
 async def update_fl_sequences(ctx: dict, *args, prefix: Optional[str] = None, **kwargs):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libseqname.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -386,7 +399,7 @@ async def update_fl_sequences_info(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libseq.value,
@@ -394,8 +407,10 @@ async def update_fl_sequences_info(
             JobId.update_books.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -445,15 +460,17 @@ async def update_fl_book_annotations(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_lib_b_annotations.value,
             JobId.update_books.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -507,15 +524,17 @@ async def update_fl_book_annotations_pic(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_lib_b_annotations_pics.value,
             JobId.update_book_annotations.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -545,15 +564,17 @@ async def update_fl_author_annotations(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_lib_a_annotations.value,
             JobId.update_authors.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -640,14 +661,16 @@ async def update_fl_author_annotations_pics(
 async def update_fl_genres(ctx: dict, *args, prefix: Optional[str] = None, **kwargs):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libgenrelist.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -692,7 +715,7 @@ async def update_fl_books_genres(
 ):
     arq_pool: ArqRedis = ctx["arq_pool"]
 
-    if not await is_jobs_complete(
+    is_deps_complete, not_complete_count = await is_jobs_complete(
         arq_pool,
         [
             JobId.import_libgenre.value,
@@ -700,8 +723,10 @@ async def update_fl_books_genres(
             JobId.update_genres.value,
         ],
         prefix=prefix,
-    ):
-        raise Retry(defer=60)
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -740,9 +765,36 @@ async def update_fl_books_genres(
     mysql.close()
 
 
-async def run_fl_update(ctx: dict, *args, **kwargs) -> bool:
-    prefix = str(int(time.time()) // (5 * 60))
+async def update_fl_webhook(
+    ctx: dict,
+    *args,
+    prefix: Optional[str] = None,
+    **kwargs,
+):
+    arq_pool: ArqRedis = ctx["arq_pool"]
 
+    is_deps_complete, not_complete_count = await is_jobs_complete(
+        arq_pool, [e.value for e in JobId if e != JobId.webhook], prefix=prefix
+    )
+
+    if not is_deps_complete:
+        raise Retry(defer=60 * not_complete_count)
+
+    all_success = True
+
+    for webhook in env_config.WEBHOOKS:
+        async with httpx.AsyncClient() as client:
+            response: httpx.Response = await getattr(client, webhook.method)(
+                webhook.url, headers=webhook.headers
+            )
+
+            if response.status_code != 200:
+                all_success = False
+
+    return all_success
+
+
+async def run_fl_update(ctx: dict, *args, **kwargs) -> bool:
     IMPORTS = {
         JobId.import_libbook: "lib.libbook.sql",
         JobId.import_libavtor: "lib.libavtor.sql",
@@ -771,9 +823,11 @@ async def run_fl_update(ctx: dict, *args, **kwargs) -> bool:
         JobId.update_sequences,
         JobId.update_sequences_info,
         JobId.update_genres,
+        JobId.webhook,
     )
 
     arq_pool: ArqRedis = ctx["arq_pool"]
+    prefix = str(int(time.time()) // (5 * 60))
 
     for job_id, filename in IMPORTS.items():
         await arq_pool.enqueue_job(
@@ -803,4 +857,5 @@ __tasks__ = [
     update_fl_author_annotations_pics,
     update_fl_genres,
     update_fl_books_genres,
+    update_fl_webhook,
 ]

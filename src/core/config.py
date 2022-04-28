@@ -32,5 +32,7 @@ class EnvConfig(BaseSettings):
 
     SENTRY_DSN: str
 
+    WEBHOOKS: list[WebhookConfig]
+
 
 env_config = EnvConfig()
