@@ -51,7 +51,7 @@ class JobId(Enum):
     update_genres = "update_fl_genres"
     update_books_genres = "update_fl_books_genres"
 
-    webhook = "fl_webhook"
+    webhook = "update_fl_webhook"
 
 
 async def import_fl_dump(ctx: dict, filename: str, *args, **kwargs):
