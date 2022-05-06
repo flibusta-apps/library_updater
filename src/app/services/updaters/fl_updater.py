@@ -55,15 +55,18 @@ class JobId(Enum):
 
 
 async def import_fl_dump(ctx: dict, filename: str, *args, **kwargs):
-    await run_cmd(
+    stdout, stderr, return_code = await run_cmd(
         f"wget -O - {env_config.FL_BASE_URL}/sql/{filename}.gz | gunzip | "
         f"mysql -h {env_config.MYSQL_HOST} -u {env_config.MYSQL_USER} "
         f'-p"{env_config.MYSQL_PASSWORD}" {env_config.MYSQL_DB_NAME}'
     )
 
+    if return_code != 0:
+        raise InterruptedError(stdout, stderr)
+
 
 async def get_db_cons() -> tuple[asyncpg.Connection, aiomysql.Connection]:
-    posgres = await asyncpg.connect(
+    postgres = await asyncpg.connect(
         database=env_config.POSTGRES_DB_NAME,
         host=env_config.POSTGRES_HOST,
         port=env_config.POSTGRES_PORT,
@@ -79,9 +82,9 @@ async def get_db_cons() -> tuple[asyncpg.Connection, aiomysql.Connection]:
         password=env_config.MYSQL_PASSWORD,
     )
 
-    assert posgres
+    assert postgres
 
-    return posgres, mysql
+    return postgres, mysql
 
 
 async def get_source(postgres: asyncpg.Connection) -> int:
