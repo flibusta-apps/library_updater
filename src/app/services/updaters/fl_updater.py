@@ -191,24 +191,25 @@ async def update_fl_books(ctx: dict, *args, prefix: Optional[str] = None, **kwar
             row[3],
             row[4],
             row[5] == "1",
+            row[6],
         ]
 
     await postgres.execute(
         """
         CREATE OR REPLACE FUNCTION update_book(
             source_ smallint, remote_id_ int, title_ varchar, lang_ varchar,
-            file_type_ varchar, uploaded_ date, is_deleted_ boolean
+            file_type_ varchar, uploaded_ date, is_deleted_ boolean, pages_ int
         ) RETURNS void AS $$
             BEGIN
                 IF EXISTS (SELECT * FROM books WHERE source = source_ AND remote_id = remote_id_) THEN
                     UPDATE books SET title = title_, lang = lang_, file_type = file_type_,
-                                        uploaded = uploaded_, is_deleted = is_deleted
+                                     uploaded = uploaded_, is_deleted = is_deleted, pages = pages_
                     WHERE source = source_ AND remote_id = remote_id_;
                     RETURN;
                 END IF;
 
-                INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted)
-                    VALUES (source_, remote_id_, title_, lang_, file_type_, uploaded_, is_deleted_);
+                INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages)
+                    VALUES (source_, remote_id_, title_, lang_, file_type_, uploaded_, is_deleted_, pages_);
             END;
         $$ LANGUAGE plpgsql;
     """
@@ -216,12 +217,12 @@ async def update_fl_books(ctx: dict, *args, prefix: Optional[str] = None, **kwar
 
     async with mysql.cursor(aiomysql.SSCursor) as cursor:
         await cursor.execute(
-            "SELECT BookId, Title, Lang, FileType, Time, Deleted FROM libbook;"
+            "SELECT BookId, Title, Lang, FileType, Time, Deleted, Pages FROM libbook;"
         )
 
         while rows := await cursor.fetchmany(1024):
             await postgres.executemany(
-                "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7);",
+                "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8);",
                 (prepare_book(row) for row in rows),
             )
 
