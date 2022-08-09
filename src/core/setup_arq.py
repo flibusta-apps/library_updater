@@ -24,6 +24,6 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = get_redis_settings()
     max_jobs = 2
-    max_tries = 20
-    job_timeout = 5 * 60
+    max_tries = 30
+    job_timeout = 10 * 60
     cron_jobs = [cron(run_fl_update, hour={5}, minute=0)]

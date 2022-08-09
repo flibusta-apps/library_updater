@@ -112,7 +112,7 @@ async def update_fl_authors(ctx: dict, *args, prefix: Optional[str] = None, **kw
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -169,7 +169,7 @@ async def update_fl_books(ctx: dict, *args, prefix: Optional[str] = None, **kwar
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -246,7 +246,7 @@ async def update_fl_books_authors(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -301,7 +301,7 @@ async def update_fl_translations(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -357,7 +357,7 @@ async def update_fl_sequences(ctx: dict, *args, prefix: Optional[str] = None, **
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -414,7 +414,7 @@ async def update_fl_sequences_info(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -474,7 +474,7 @@ async def update_fl_book_annotations(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -538,7 +538,7 @@ async def update_fl_book_annotations_pic(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -578,7 +578,7 @@ async def update_fl_author_annotations(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -674,7 +674,7 @@ async def update_fl_genres(ctx: dict, *args, prefix: Optional[str] = None, **kwa
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -730,7 +730,7 @@ async def update_fl_books_genres(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     postgres, mysql = await get_db_cons()
 
@@ -782,7 +782,7 @@ async def update_fl_webhook(
     )
 
     if not is_deps_complete:
-        raise Retry(defer=60 * not_complete_count)
+        raise Retry(defer=45 * not_complete_count)
 
     all_success = True
 
