@@ -1,10 +1,13 @@
 from arq.connections import ArqRedis
-from arq.cron import cron
 
 from app.services.updaters.fl_updater import __tasks__ as fl_tasks
-from app.services.updaters.fl_updater import run_fl_update
+
+# from app.services.updaters.fl_updater import run_fl_update
 from core.arq_pool import get_redis_settings, get_arq_pool
 import core.sentry  # noqa: F401
+
+
+# from arq.cron import cron
 
 
 async def startup(ctx):
@@ -26,4 +29,4 @@ class WorkerSettings:
     max_jobs = 2
     max_tries = 30
     job_timeout = 10 * 60
-    cron_jobs = [cron(run_fl_update, hour={5}, minute=0)]
+    # cron_jobs = [cron(run_fl_update, hour={5}, minute=0)]
