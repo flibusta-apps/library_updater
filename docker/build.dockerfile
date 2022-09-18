@@ -1,29 +1,29 @@
-FROM ghcr.io/kurbezz/base_docker_images:3.10-postgres-asyncpg-poetry-buildtime as build-image
+FROM lukemathwalker/cargo-chef:latest-rust-slim-buster AS chef
+WORKDIR /app
 
-WORKDIR /root/poetry
-COPY pyproject.toml poetry.lock /root/poetry/
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-ENV VENV_PATH=/opt/venv
-RUN poetry export --without-hashes > requirements.txt \
-    && . "${VENV_PATH}/bin/activate" \
-    && pip install -r requirements.txt --no-cache-dir
-
-
-FROM ghcr.io/kurbezz/base_docker_images:3.10-postgres-runtime as runtime-image
-
+FROM chef AS builder
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y wget default-mysql-client-core \
+    && apt-get install -y pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-ENV VENV_PATH=/opt/venv
-ENV PATH="$VENV_PATH/bin:$PATH"
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --bin library_updater
 
-WORKDIR /app/
+FROM debian:bullseye-slim
 
-COPY ./src/ /app/
-COPY --from=build-image $VENV_PATH $VENV_PATH
-COPY ./scripts/healthcheck.py /root/
+RUN apt-get update \
+    && apt-get install -y openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 8080
+RUN update-ca-certificates
 
-CMD gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8080
+WORKDIR /app
+
+COPY --from=builder /app/target/release/library_updater /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/library_updater"]
