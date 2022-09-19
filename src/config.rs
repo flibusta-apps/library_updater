@@ -17,6 +17,8 @@ pub struct Webhook {
 }
 
 pub struct Config {
+    pub api_key: String,
+
     pub sentry_dsn: String,
 
     pub postgres_db_name: String,
@@ -37,6 +39,8 @@ fn get_env(env: &'static str) -> String {
 impl Config {
     pub fn load() -> Config {
         Config {
+            api_key: get_env("API_KEY"),
+
             sentry_dsn: get_env("SENTRY_DSN"),
 
             postgres_db_name: get_env("POSTGRES_DB_NAME"),
