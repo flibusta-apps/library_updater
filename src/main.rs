@@ -27,7 +27,7 @@ async fn update(headers: HeaderMap) -> &'static str {
         match updater::update().await {
             Ok(_) => log::info!("Updated!"),
             Err(err) => log::info!("Updater err: {:?}", err),
-        }
+        };
     });
 
     "Update started"

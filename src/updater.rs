@@ -259,7 +259,16 @@ async fn send_webhooks() -> Result<(), Box<reqwest::Error>> {
     Ok(())
 }
 
+lazy_static! {
+    pub static ref UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+}
+
 pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = match UPDATE_LOCK.try_lock() {
+        Ok(v) => v,
+        Err(err) => return Err(Box::new(err)),
+    };
+
     log::info!("Start update...");
 
     let pool = match get_postgres_pool().await {
