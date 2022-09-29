@@ -51,7 +51,10 @@ async fn main() {
     env_logger::init();
 
     tokio::spawn(async {
-        cron_jobs().await
+        match cron_jobs().await {
+            Ok(_) => (),
+            Err(e) => panic!("{:?}", e),
+        }
     });
 
     start_app().await;
