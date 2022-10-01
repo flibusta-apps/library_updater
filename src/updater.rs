@@ -516,8 +516,12 @@ pub async fn cron_jobs() -> Result<tokio::task::JoinHandle<()>, JobSchedulerErro
 
     job_scheduler.add(update_job).await.unwrap();
 
-    match job_scheduler.start().await {
+    log::info!("Scheduler start...");
+    let result = match job_scheduler.start().await {
         Ok(v) => Ok(v),
         Err(err) => Err(err),
-    }
+    };
+    log::info!("Scheduler shutdown...");
+
+    result
 }
