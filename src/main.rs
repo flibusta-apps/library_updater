@@ -52,7 +52,7 @@ async fn main() {
 
     tokio::spawn(async {
         match cron_jobs().await {
-            Ok(_) => (),
+            Ok(v) => v.await,
             Err(e) => panic!("{:?}", e),
         }
     });

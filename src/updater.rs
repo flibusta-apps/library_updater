@@ -501,7 +501,7 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn cron_jobs() -> Result<(), JobSchedulerError> {
+pub async fn cron_jobs() -> Result<tokio::task::JoinHandle<()>, JobSchedulerError> {
     let job_scheduler = JobScheduler::new().await.unwrap();
 
     let update_job = match Job::new_async("0 0 5 * * *", |_uuid, _l| Box::pin(async {
@@ -517,7 +517,7 @@ pub async fn cron_jobs() -> Result<(), JobSchedulerError> {
     job_scheduler.add(update_job).await.unwrap();
 
     match job_scheduler.start().await {
-        Ok(_) => Ok(()),
+        Ok(v) => Ok(v),
         Err(err) => Err(err),
     }
 }
