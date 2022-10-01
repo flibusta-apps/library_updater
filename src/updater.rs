@@ -8,7 +8,7 @@ use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingM
 use futures::{io::copy, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
 use tokio::fs::{File, remove_file};
-use tokio_cron_scheduler::{JobScheduler, Job, JobSchedulerError};
+use tokio_cron_scheduler::{JobScheduler, Job};
 use tokio_postgres::NoTls;
 
 use async_compression::futures::bufread::GzipDecoder;
@@ -501,10 +501,10 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn cron_jobs() -> Result<tokio::task::JoinHandle<()>, JobSchedulerError> {
+pub async fn cron_jobs() {
     let job_scheduler = JobScheduler::new().await.unwrap();
 
-    let update_job = match Job::new_async("0 0 5 * * *", |_uuid, _l| Box::pin(async {
+    let update_job = match Job::new_async("0 0 2 * * *", |_uuid, _l| Box::pin(async {
         match update().await {
             Ok(_) => log::info!("Updated"),
             Err(err) => log::info!("Update err: {:?}", err),
@@ -517,11 +517,13 @@ pub async fn cron_jobs() -> Result<tokio::task::JoinHandle<()>, JobSchedulerErro
     job_scheduler.add(update_job).await.unwrap();
 
     log::info!("Scheduler start...");
-    let result = match job_scheduler.start().await {
-        Ok(v) => Ok(v),
-        Err(err) => Err(err),
+    let join_handler = match job_scheduler.start().await {
+        Ok(v) => v,
+        Err(err) => panic!("{:?}", err),
+    };
+    match join_handler.await {
+        Ok(_) => (),
+        Err(err) => panic!("{:?}", err),
     };
     log::info!("Scheduler shutdown...");
-
-    result
 }

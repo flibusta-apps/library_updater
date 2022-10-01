@@ -39,10 +39,12 @@ async fn start_app() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
+    log::info!("Start webserver...");
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
         .unwrap();
+    log::info!("Webserver shutdown...")
 }
 
 #[tokio::main]
@@ -50,12 +52,8 @@ async fn main() {
     let _guard = sentry::init(config::CONFIG.sentry_dsn.clone());
     env_logger::init();
 
-    tokio::spawn(async {
-        match cron_jobs().await {
-            Ok(v) => v.await,
-            Err(e) => panic!("{:?}", e),
-        }
-    });
-
-    start_app().await;
+    tokio::join![
+        cron_jobs(),
+        start_app()
+    ];
 }
