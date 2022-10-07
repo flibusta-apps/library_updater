@@ -504,7 +504,7 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
 pub async fn cron_jobs() {
     let job_scheduler = JobScheduler::new().await.unwrap();
 
-    let update_job = match Job::new_async("0 0 2 * * *", |_uuid, _l| Box::pin(async {
+    let update_job = match Job::new_async("0 0 3 * * *", |_uuid, _l| Box::pin(async {
         match update().await {
             Ok(_) => log::info!("Updated"),
             Err(err) => log::info!("Update err: {:?}", err),
