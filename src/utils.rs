@@ -11,7 +11,7 @@ where
 }
 
 pub fn remove_wrong_chars(s: &str) -> String {
-    s.replace(';', "").replace('\n', " ").replace('ё', "е").replace("\"", "")
+    s.replace(';', "").replace('\n', " ").replace('ё', "е").replace("\\\"", "\"")
 }
 
 pub fn parse_lang(s: &str) -> String {
@@ -23,5 +23,5 @@ pub fn fix_annotation_text(text: &str) -> String {
         .replace("[b]", "")
         .replace("[/b]", "")
         .replace("[hr]", "")
-        .replace("\"", "")
+        .replace("\\\"", "\"")
 }
