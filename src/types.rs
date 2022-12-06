@@ -424,8 +424,7 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
                     operand,
                 } => match (op, operand.as_ref()) {
                     (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => {
-                        let value: i64 = (v.0).try_into().unwrap();
-                        -value
+                        v.0.try_into().unwrap()
                     }
                     (_, _) => panic!("SequenceInfo.position = {:?}", &value[2]),
                 },
