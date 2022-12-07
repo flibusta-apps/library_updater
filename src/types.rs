@@ -447,10 +447,10 @@ impl Update for SequenceInfo {
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
                     SELECT id INTO sequence_id FROM sequences WHERE source = source_ AND remote_id = sequence_;
                     IF EXISTS (SELECT * FROM book_sequences WHERE book = book_id AND sequence = sequence_id) THEN
-                        UPDATE book_sequences SET position = position_ WHERE book = book_id AND sequence = sequence_id;
+                        UPDATE book_sequences SET position = ABS(position_) WHERE book = book_id AND sequence = sequence_id;
                         RETURN;
                     END IF;
-                    INSERT INTO book_sequences (book, sequence, position) VALUES (book_id, sequence_id, position_);
+                    INSERT INTO book_sequences (book, sequence, position) VALUES (book_id, sequence_id, ABS(position_));
                 END;
             $$ LANGUAGE plpgsql;
             "
