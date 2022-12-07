@@ -402,7 +402,7 @@ impl Update for Sequence {
 pub struct SequenceInfo {
     pub book_id: u64,
     pub sequence_id: u64,
-    pub position: i64,
+    pub position: u64,
 }
 
 impl FromVecExpression<SequenceInfo> for SequenceInfo {
@@ -417,14 +417,14 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
                 _ => panic!("SequenceInfo.sequence_id"),
             },
             position: match &value[2] {
-                sql_parse::Expression::Integer(v) => v.0.try_into().unwrap(),
+                sql_parse::Expression::Integer(v) => v.0,
                 sql_parse::Expression::Unary {
                     op,
                     op_span: _,
                     operand,
                 } => match (op, operand.as_ref()) {
                     (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => {
-                        v.0.try_into().unwrap()
+                        v.0
                     }
                     (_, _) => panic!("SequenceInfo.position = {:?}", &value[2]),
                 },
