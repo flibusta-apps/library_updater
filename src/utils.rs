@@ -29,4 +29,8 @@ pub fn fix_annotation_text(text: &str) -> String {
         .replace("[hr]", "")
         .replace("\\\"", "\"")
         .replace("\\'", "'")
+        .replace("<p class=\"book\">", "")
+        .replace("</p>", "")
+        .replace("<br>", "\n")
+        .replace("\\n", "\n")
 }
