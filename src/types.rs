@@ -134,7 +134,7 @@ impl FromVecExpression<Book> for Book {
                 _ => panic!("Book.uploaded"),
             },
             is_deleted: match &value[11] {
-                sql_parse::Expression::String(v) => v.value == "1",
+                sql_parse::Expression::String(v) => v.value.eq("1"),
                 _ => panic!("Book.is_deleted"),
             },
             pages: match &value[20] {
