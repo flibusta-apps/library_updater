@@ -159,7 +159,7 @@ impl Update for Book {
                 BEGIN
                     IF EXISTS (SELECT * FROM books WHERE source = source_ AND remote_id = remote_id_) THEN
                         UPDATE books SET title = title_, lang = lang_, file_type = file_type_,
-                                         uploaded = uploaded_, is_deleted = is_deleted, pages = pages_
+                                         uploaded = uploaded_, is_deleted = is_deleted_, pages = pages_
                         WHERE source = source_ AND remote_id = remote_id_;
                         RETURN;
                     END IF;
