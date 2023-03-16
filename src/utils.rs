@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
+use ammonia::Builder;
+use maplit::hashset;
 
 pub fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where
@@ -23,14 +25,11 @@ pub fn parse_lang(s: &str) -> String {
 }
 
 pub fn fix_annotation_text(text: &str) -> String {
-    text.replace("&nbsp;", "")
-        .replace("[b]", "")
-        .replace("[/b]", "")
-        .replace("[hr]", "")
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("<p class=\"book\">", "")
-        .replace("</p>", "")
-        .replace("<br>", "\n")
-        .replace("\\n", "\n")
+    let temp_text = text.replace("<br>", "\n").replace("\\n", "\n");
+
+    let tags = hashset!["a"];
+    Builder::new()
+        .tags(tags)
+        .clean(&temp_text)
+        .to_string()
 }
