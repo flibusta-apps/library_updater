@@ -225,9 +225,15 @@ impl Update for BookAuthor {
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
                     SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
+
+                    IF book_id IS NULL OR author_id IS NULL
+                        RETURN;
+                    END IF;
+
                     IF EXISTS (SELECT * FROM book_authors WHERE book = book_id AND author = author_id) THEN
                         RETURN;
                     END IF;
+
                     INSERT INTO book_authors (book, author) VALUES (book_id, author_id);
                 END;
             $$ LANGUAGE plpgsql;
