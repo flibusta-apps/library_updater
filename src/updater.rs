@@ -83,7 +83,7 @@ async fn process<T>(
 where
     T: Debug + FromVecExpression<T> + Update,
 {
-    if deps.len() != 0 {
+    if !deps.is_empty() {
         loop {
             let mut some_failed = false;
             let mut some_none = false;
@@ -155,7 +155,7 @@ where
                         match value.update(&client, source_id).await {
                             Ok(_) => {
                                 // log::info!("{:?}", value);
-                                ()
+                                
                             }
                             Err(err) => {
                                 log::error!("Update error: {:?} : {:?}", value, err);

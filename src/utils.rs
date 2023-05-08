@@ -21,7 +21,7 @@ pub fn remove_wrong_chars(s: &str) -> String {
 }
 
 pub fn parse_lang(s: &str) -> String {
-    s.replace('-', "").replace('~', "").to_lowercase()
+    s.replace(['-', '~'], "").to_lowercase()
 }
 
 pub fn fix_annotation_text(text: &str) -> String {

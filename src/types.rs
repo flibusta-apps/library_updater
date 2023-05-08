@@ -127,7 +127,7 @@ impl FromVecExpression<Book> for Book {
             },
             uploaded: match &value[2] {
                 sql_parse::Expression::String(v) => {
-                    NaiveDateTime::parse_from_str(&v.value.to_string(), "%Y-%m-%d %H:%M:%S")
+                    NaiveDateTime::parse_from_str(&v.value, "%Y-%m-%d %H:%M:%S")
                         .unwrap()
                         .date()
                 }
