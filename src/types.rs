@@ -6,7 +6,7 @@ use tokio_postgres::Client;
 use crate::utils::{fix_annotation_text, parse_lang, remove_wrong_chars};
 
 pub trait FromVecExpression<T> {
-    fn from_vec_expression(value: &Vec<Expression>) -> T;
+    fn from_vec_expression(value: &[Expression]) -> T;
 }
 
 #[async_trait]
@@ -31,7 +31,7 @@ pub struct Author {
 }
 
 impl FromVecExpression<Author> for Author {
-    fn from_vec_expression(value: &Vec<Expression>) -> Author {
+    fn from_vec_expression(value: &[Expression]) -> Author {
         Author {
             id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -107,7 +107,7 @@ pub struct Book {
 }
 
 impl FromVecExpression<Book> for Book {
-    fn from_vec_expression(value: &Vec<Expression>) -> Book {
+    fn from_vec_expression(value: &[Expression]) -> Book {
         Book {
             id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -197,7 +197,7 @@ pub struct BookAuthor {
 }
 
 impl FromVecExpression<BookAuthor> for BookAuthor {
-    fn from_vec_expression(value: &Vec<Expression>) -> BookAuthor {
+    fn from_vec_expression(value: &[Expression]) -> BookAuthor {
         BookAuthor {
             book_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -270,7 +270,7 @@ pub struct Translator {
 }
 
 impl FromVecExpression<Translator> for Translator {
-    fn from_vec_expression(value: &Vec<Expression>) -> Translator {
+    fn from_vec_expression(value: &[Expression]) -> Translator {
         Translator {
             book_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -347,7 +347,7 @@ pub struct Sequence {
 }
 
 impl FromVecExpression<Sequence> for Sequence {
-    fn from_vec_expression(value: &Vec<Expression>) -> Sequence {
+    fn from_vec_expression(value: &[Expression]) -> Sequence {
         Sequence {
             id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -410,7 +410,7 @@ pub struct SequenceInfo {
 }
 
 impl FromVecExpression<SequenceInfo> for SequenceInfo {
-    fn from_vec_expression(value: &Vec<Expression>) -> SequenceInfo {
+    fn from_vec_expression(value: &[Expression]) -> SequenceInfo {
         SequenceInfo {
             book_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -497,7 +497,7 @@ pub struct BookAnnotation {
 }
 
 impl FromVecExpression<BookAnnotation> for BookAnnotation {
-    fn from_vec_expression(value: &Vec<Expression>) -> BookAnnotation {
+    fn from_vec_expression(value: &[Expression]) -> BookAnnotation {
         BookAnnotation {
             book_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -572,7 +572,7 @@ pub struct BookAnnotationPic {
 }
 
 impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
-    fn from_vec_expression(value: &Vec<Expression>) -> BookAnnotationPic {
+    fn from_vec_expression(value: &[Expression]) -> BookAnnotationPic {
         BookAnnotationPic {
             book_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -625,7 +625,7 @@ pub struct AuthorAnnotation {
 }
 
 impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
-    fn from_vec_expression(value: &Vec<Expression>) -> AuthorAnnotation {
+    fn from_vec_expression(value: &[Expression]) -> AuthorAnnotation {
         AuthorAnnotation {
             author_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -700,7 +700,7 @@ pub struct AuthorAnnotationPic {
 }
 
 impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
-    fn from_vec_expression(value: &Vec<Expression>) -> AuthorAnnotationPic {
+    fn from_vec_expression(value: &[Expression]) -> AuthorAnnotationPic {
         AuthorAnnotationPic {
             author_id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -753,7 +753,7 @@ pub struct Genre {
 }
 
 impl FromVecExpression<Genre> for Genre {
-    fn from_vec_expression(value: &Vec<Expression>) -> Genre {
+    fn from_vec_expression(value: &[Expression]) -> Genre {
         Genre {
             id: match &value[0] {
                 sql_parse::Expression::Integer(v) => v.0,
@@ -826,7 +826,7 @@ pub struct BookGenre {
 }
 
 impl FromVecExpression<BookGenre> for BookGenre {
-    fn from_vec_expression(value: &Vec<Expression>) -> BookGenre {
+    fn from_vec_expression(value: &[Expression]) -> BookGenre {
         BookGenre {
             book_id: match &value[1] {
                 sql_parse::Expression::Integer(v) => v.0,

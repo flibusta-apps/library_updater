@@ -140,32 +140,28 @@ where
         let mut issues = Vec::new();
         let ast = parse_statement(&line, &mut issues, &parse_options);
 
-        match ast {
-            Some(Statement::InsertReplace(
-                i @ InsertReplace {
-                    type_: InsertReplaceType::Insert(_),
-                    ..
-                },
-            )) => {
-                for value in i.values.into_iter() {
-                    for t_value in value.1.into_iter() {
-                        let value = T::from_vec_expression(&t_value);
-                        let client = pool.get().await.unwrap();
+        if let Some(Statement::InsertReplace(
+            i @ InsertReplace {
+                type_: InsertReplaceType::Insert(_),
+                ..
+            },
+        )) = ast {
+            for value in i.values.into_iter() {
+                for t_value in value.1.into_iter() {
+                    let value = T::from_vec_expression(&t_value);
+                    let client = pool.get().await.unwrap();
 
-                        match value.update(&client, source_id).await {
-                            Ok(_) => {
-                                // log::info!("{:?}", value);
-                                
-                            }
-                            Err(err) => {
-                                log::error!("Update error: {:?} : {:?}", value, err);
-                                return Err(err)
-                            },
+                    match value.update(&client, source_id).await {
+                        Ok(_) => {
+                            // log::info!("{:?}", value);
                         }
+                        Err(err) => {
+                            log::error!("Update error: {:?} : {:?}", value, err);
+                            return Err(err)
+                        },
                     }
                 }
             }
-            _ => (),
         }
     }
 
