@@ -513,13 +513,10 @@ pub async fn cron_jobs() {
     job_scheduler.add(update_job).await.unwrap();
 
     log::info!("Scheduler start...");
-    let join_handler = match job_scheduler.start().await {
+    match job_scheduler.start().await {
         Ok(v) => v,
         Err(err) => panic!("{:?}", err),
     };
-    match join_handler.await {
-        Ok(_) => (),
-        Err(err) => panic!("{:?}", err),
-    };
+
     log::info!("Scheduler shutdown...");
 }
