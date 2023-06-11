@@ -1,6 +1,7 @@
 use std::{
     fmt::Debug,
-    sync::{Arc, Mutex}, str::FromStr
+    sync::Arc,
+    str::FromStr
 };
 
 use crate::config::{Webhook, self};
@@ -8,6 +9,7 @@ use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingM
 use futures::{io::copy, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
 use tokio::fs::{File, remove_file};
+use tokio::sync::Mutex;
 use tokio_cron_scheduler::{JobScheduler, Job};
 use tokio_postgres::NoTls;
 
@@ -89,7 +91,7 @@ where
             let mut some_none = false;
 
             for dep in deps.iter() {
-                let status = dep.lock().unwrap();
+                let status = dep.lock().await;
                 match &*status {
                     Some(status) => match status {
                         UpdateStatus::Success => (),
@@ -291,12 +293,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         match process::<Author>(pool_clone, *source_id_clone, "lib.libavtorname.sql", vec![]).await
         {
             Ok(_) => {
-                let mut status = author_status_clone.lock().unwrap();
+                let mut status = author_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = author_status_clone.lock().unwrap();
+                let mut status = author_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Err(err)
             }
@@ -309,12 +311,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     let book_process = tokio::spawn(async move {
         match process::<Book>(pool_clone, *source_id_clone, "lib.libbook.sql", vec![]).await {
             Ok(_) => {
-                let mut status = book_status_clone.lock().unwrap();
+                let mut status = book_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = book_status_clone.lock().unwrap();
+                let mut status = book_status_clone.lock().await;
                 *status = Some(UpdateStatus::Fail);
                 Err(err)
             }
@@ -342,12 +344,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         match process::<Sequence>(pool_clone, *source_id_clone, "lib.libseqname.sql", vec![]).await
         {
             Ok(_) => {
-                let mut status = sequence_status_clone.lock().unwrap();
+                let mut status = sequence_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = sequence_status_clone.lock().unwrap();
+                let mut status = sequence_status_clone.lock().await;
                 *status = Some(UpdateStatus::Fail);
                 Err(err)
             }
@@ -370,12 +372,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             Ok(_) => {
-                let mut status = book_annotation_status_clone.lock().unwrap();
+                let mut status = book_annotation_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = book_annotation_status_clone.lock().unwrap();
+                let mut status = book_annotation_status_clone.lock().await;
                 *status = Some(UpdateStatus::Fail);
                 Err(err)
             }
@@ -409,12 +411,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             Ok(_) => {
-                let mut status = author_annotation_status_clone.lock().unwrap();
+                let mut status = author_annotation_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = author_annotation_status_clone.lock().unwrap();
+                let mut status = author_annotation_status_clone.lock().await;
                 *status = Some(UpdateStatus::Fail);
                 Err(err)
             }
@@ -440,12 +442,12 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     let genre_annotation_process = tokio::spawn(async move {
         match process::<Genre>(pool_clone, *source_id_clone, "lib.libgenrelist.sql", vec![]).await {
             Ok(_) => {
-                let mut status = genre_status_clone.lock().unwrap();
+                let mut status = genre_status_clone.lock().await;
                 *status = Some(UpdateStatus::Success);
                 Ok(())
             }
             Err(err) => {
-                let mut status = genre_status_clone.lock().unwrap();
+                let mut status = genre_status_clone.lock().await;
                 *status = Some(UpdateStatus::Fail);
                 Err(err)
             }
