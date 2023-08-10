@@ -20,6 +20,10 @@ pub trait Update {
         client: &Client,
         source_id: i16,
     ) -> Result<(), Box<tokio_postgres::Error>>;
+
+    async fn after_update(
+        client: &Client,
+    ) -> Result<(), Box<tokio_postgres::Error>>;
 }
 
 #[derive(Debug)]
@@ -92,6 +96,12 @@ impl Update for Author {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }
 
@@ -187,6 +197,18 @@ impl Update for Book {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        match client.execute(
+            "UPDATE books SET is_deleted = 't' WHERE lang NOT IN ('ru', 'be', 'uk');",
+            &[]
+        ).await {
+            Ok(_) => Ok(()),
+            Err(err) => Err(Box::new(err)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -259,6 +281,12 @@ impl Update for BookAuthor {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }
 
@@ -338,6 +366,12 @@ impl Update for Translator {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -399,6 +433,12 @@ impl Update for Sequence {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }
 
@@ -487,6 +527,12 @@ impl Update for SequenceInfo {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -563,6 +609,12 @@ impl Update for BookAnnotation {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -614,6 +666,12 @@ WHERE book = books.id;\
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }
 
@@ -691,6 +749,12 @@ impl Update for AuthorAnnotation {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -741,6 +805,12 @@ WHERE author = authors.id;",
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }
 
@@ -817,6 +887,12 @@ impl Update for Genre {
             Err(err) => Err(Box::new(err)),
         }
     }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -863,5 +939,11 @@ impl Update for BookGenre {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
+    }
+
+    async fn after_update(
+        _client: &Client
+    ) -> Result<(), Box<tokio_postgres::Error>> {
+        Ok(())
     }
 }

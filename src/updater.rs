@@ -167,6 +167,11 @@ where
         }
     }
 
+    match T::after_update(&pool.get().await.unwrap()).await {
+        Ok(_) => (),
+        Err(err) => return Err(err),
+    };
+
     log::info!("Updated {file_name}...");
 
     Ok(())
