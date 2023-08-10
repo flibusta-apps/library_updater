@@ -6,8 +6,9 @@ pub mod types;
 pub mod utils;
 pub mod updater;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, str::FromStr};
 use axum::{Router, routing::post, http::HeaderMap};
+use sentry::{ClientOptions, types::Dsn, integrations::debug_images::DebugImagesIntegration};
 
 use crate::updater::cron_jobs;
 
@@ -49,8 +50,16 @@ async fn start_app() {
 
 #[tokio::main]
 async fn main() {
-    let _guard = sentry::init(config::CONFIG.sentry_dsn.clone());
     env_logger::init();
+
+    let options = ClientOptions {
+        dsn: Some(Dsn::from_str(&config::CONFIG.sentry_dsn).unwrap()),
+        default_integrations: false,
+        ..Default::default()
+    }
+    .add_integration(DebugImagesIntegration::new());
+
+    let _guard = sentry::init(options);
 
     tokio::join![
         cron_jobs(),
