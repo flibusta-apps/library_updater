@@ -329,6 +329,11 @@ impl Update for Translator {
                     author_id integer := -1;
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+
+                    IF book_id IS NULL OR author_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
                     SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
                     IF EXISTS (SELECT * FROM translations WHERE book = book_id AND author = author_id) THEN
                         UPDATE translations SET position = position_
@@ -497,6 +502,11 @@ impl Update for SequenceInfo {
                     END IF;
 
                     SELECT id INTO sequence_id FROM sequences WHERE source = source_ AND remote_id = sequence_;
+
+                    IF sequence_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
                     IF EXISTS (SELECT * FROM book_sequences WHERE book = book_id AND sequence = sequence_id) THEN
                         UPDATE book_sequences SET position = ABS(position_) WHERE book = book_id AND sequence = sequence_id;
                         RETURN;
