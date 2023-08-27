@@ -491,6 +491,11 @@ impl Update for SequenceInfo {
                     sequence_id integer := -1;
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+
+                    IF book_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
                     SELECT id INTO sequence_id FROM sequences WHERE source = source_ AND remote_id = sequence_;
                     IF EXISTS (SELECT * FROM book_sequences WHERE book = book_id AND sequence = sequence_id) THEN
                         UPDATE book_sequences SET position = ABS(position_) WHERE book = book_id AND sequence = sequence_id;
@@ -858,6 +863,11 @@ impl Update for Genre {
                     genre_id integer := -1;
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+
+                    IF book_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
                     SELECT id INTO genre_id FROM genres WHERE source = source_ AND remote_id = genre_;
                     IF EXISTS (SELECT * FROM book_genres WHERE book = book_id AND genre = genre_id) THEN
                         RETURN;
