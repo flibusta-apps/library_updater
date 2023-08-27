@@ -12,6 +12,7 @@ use tokio::fs::{File, remove_file};
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{JobScheduler, Job};
 use tokio_postgres::NoTls;
+use tracing::log;
 
 use async_compression::futures::bufread::GzipDecoder;
 

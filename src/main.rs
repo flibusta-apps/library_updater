@@ -9,8 +9,12 @@ pub mod updater;
 use std::{net::SocketAddr, str::FromStr};
 use axum::{Router, routing::post, http::HeaderMap};
 use sentry::{ClientOptions, types::Dsn, integrations::debug_images::DebugImagesIntegration};
+use tracing::log;
+use tower_http::trace::{TraceLayer, self};
+use tracing::Level;
 
 use crate::updater::cron_jobs;
+
 
 async fn update(headers: HeaderMap) -> &'static str {
     let config_api_key = config::CONFIG.api_key.clone();
@@ -34,9 +38,15 @@ async fn update(headers: HeaderMap) -> &'static str {
     "Update started"
 }
 
+
 async fn start_app() {
     let app = Router::new()
-        .route("/update", post(update));
+        .route("/update", post(update))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+        );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
@@ -50,7 +60,10 @@ async fn start_app() {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .init();
 
     let options = ClientOptions {
         dsn: Some(Dsn::from_str(&config::CONFIG.sentry_dsn).unwrap()),
