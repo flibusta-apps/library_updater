@@ -525,6 +525,4 @@ pub async fn cron_jobs() {
         Ok(v) => v,
         Err(err) => panic!("{:?}", err),
     };
-
-    log::info!("Scheduler shutdown...");
 }
