@@ -47,7 +47,7 @@ mod tests {
     use crate::utils::fix_annotation_text;
 
     #[test]
-    fn test_fix_annnotation_text_remove_extra_spaces() {
+    fn test_fix_annotation_text_remove_extra_spaces() {
         let input = "    ";
         let expected_result = " ";
 
