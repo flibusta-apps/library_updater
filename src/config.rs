@@ -6,7 +6,7 @@ pub enum Method {
     #[serde(rename = "get")]
     Get,
     #[serde(rename = "post")]
-    Post
+    Post,
 }
 
 #[derive(Deserialize, Clone)]

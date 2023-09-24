@@ -11,9 +11,7 @@ pub trait FromVecExpression<T> {
 
 #[async_trait]
 pub trait Update {
-    async fn before_update(
-        client: &Client,
-    ) -> Result<(), Box<tokio_postgres::Error>>;
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>>;
 
     async fn update(
         &self,
@@ -21,9 +19,7 @@ pub trait Update {
         source_id: i16,
     ) -> Result<(), Box<tokio_postgres::Error>>;
 
-    async fn after_update(
-        client: &Client,
-    ) -> Result<(), Box<tokio_postgres::Error>>;
+    async fn after_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>>;
 }
 
 #[derive(Debug)]
@@ -59,9 +55,7 @@ impl FromVecExpression<Author> for Author {
 
 #[async_trait]
 impl Update for Author {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_author(
@@ -98,9 +92,7 @@ impl Update for Author {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -157,9 +149,7 @@ impl FromVecExpression<Book> for Book {
 
 #[async_trait]
 impl Update for Book {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book(
@@ -198,13 +188,14 @@ impl Update for Book {
         }
     }
 
-    async fn after_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
-        match client.execute(
-            "UPDATE books SET is_deleted = 't' WHERE lang NOT IN ('ru', 'be', 'uk');",
-            &[]
-        ).await {
+    async fn after_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+        match client
+            .execute(
+                "UPDATE books SET is_deleted = 't' WHERE lang NOT IN ('ru', 'be', 'uk');",
+                &[],
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
@@ -235,9 +226,7 @@ impl FromVecExpression<BookAuthor> for BookAuthor {
 
 #[async_trait]
 impl Update for BookAuthor {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_author(source_ smallint, book_ integer, author_ integer) RETURNS void AS $$
@@ -283,9 +272,7 @@ impl Update for BookAuthor {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -318,9 +305,7 @@ impl FromVecExpression<Translator> for Translator {
 
 #[async_trait]
 impl Update for Translator {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_translation(source_ smallint, book_ integer, author_ integer, position_ smallint) RETURNS void AS $$
@@ -372,9 +357,7 @@ impl Update for Translator {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -402,9 +385,7 @@ impl FromVecExpression<Sequence> for Sequence {
 
 #[async_trait]
 impl Update for Sequence {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_sequences(source_ smallint, remote_id_ int, name_ varchar) RETURNS void AS $$
@@ -440,9 +421,7 @@ impl Update for Sequence {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -472,9 +451,7 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
                     op_span: _,
                     operand,
                 } => match (op, operand.as_ref()) {
-                    (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => {
-                        v.0
-                    }
+                    (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => v.0,
                     (_, _) => panic!("SequenceInfo.position = {:?}", &value[2]),
                 },
                 _ => panic!("SequenceInfo.position = {:?}", &value[2]),
@@ -485,9 +462,7 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
 
 #[async_trait]
 impl Update for SequenceInfo {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_sequence(source_ smallint, book_ integer, sequence_ integer, position_ smallint) RETURNS void AS $$
@@ -543,9 +518,7 @@ impl Update for SequenceInfo {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -579,9 +552,7 @@ impl FromVecExpression<BookAnnotation> for BookAnnotation {
 
 #[async_trait]
 impl Update for BookAnnotation {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_annotation(source_ smallint, book_ integer, title_ varchar, text_ text) RETURNS void AS $$
@@ -625,9 +596,7 @@ impl Update for BookAnnotation {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -655,9 +624,7 @@ impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
 
 #[async_trait]
 impl Update for BookAnnotationPic {
-    async fn before_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 
@@ -683,9 +650,7 @@ WHERE book = books.id;\
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -719,9 +684,7 @@ impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
 
 #[async_trait]
 impl Update for AuthorAnnotation {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_author_annotation(source_ smallint, author_ integer, title_ varchar, text_ text) RETURNS void AS $$
@@ -765,9 +728,7 @@ impl Update for AuthorAnnotation {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -795,9 +756,7 @@ impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
 
 #[async_trait]
 impl Update for AuthorAnnotationPic {
-    async fn before_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 
@@ -822,9 +781,7 @@ WHERE author = authors.id;",
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -862,9 +819,7 @@ impl FromVecExpression<Genre> for Genre {
 
 #[async_trait]
 impl Update for Genre {
-    async fn before_update(
-        client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_sequence(source_ smallint, book_ integer, genre_ integer) RETURNS void AS $$
@@ -908,9 +863,7 @@ impl Update for Genre {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }
@@ -938,9 +891,7 @@ impl FromVecExpression<BookGenre> for BookGenre {
 
 #[async_trait]
 impl Update for BookGenre {
-    async fn before_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 
@@ -961,9 +912,7 @@ impl Update for BookGenre {
         }
     }
 
-    async fn after_update(
-        _client: &Client
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         Ok(())
     }
 }

@@ -1,31 +1,27 @@
-use std::{
-    fmt::Debug,
-    sync::Arc,
-    str::FromStr
-};
+use std::{fmt::Debug, str::FromStr, sync::Arc};
 
-use crate::config::{Webhook, self};
+use crate::config::{self, Webhook};
 use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::{io::copy, TryStreamExt};
-use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
-use tokio::fs::{File, remove_file};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use tokio::fs::{remove_file, File};
 use tokio::sync::Mutex;
-use tokio_cron_scheduler::{JobScheduler, Job};
+use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_postgres::NoTls;
 use tracing::log;
 
 use async_compression::futures::bufread::GzipDecoder;
 
-use sql_parse::{
-    parse_statement, InsertReplace, InsertReplaceType, ParseOptions, SQLArguments, SQLDialect,
-    Statement,
-};
-use tokio_util::compat::TokioAsyncReadCompatExt;
 use crate::types::{
     Author, AuthorAnnotation, AuthorAnnotationPic, BookAnnotation, BookAnnotationPic, BookAuthor,
     BookGenre, FromVecExpression, Genre, Sequence, SequenceInfo, Translator, Update,
 };
 use crate::utils::read_lines;
+use sql_parse::{
+    parse_statement, InsertReplace, InsertReplaceType, ParseOptions, SQLArguments, SQLDialect,
+    Statement,
+};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::types::Book;
 
@@ -53,8 +49,8 @@ async fn download_file(filename_str: &str) -> Result<(), Box<dyn std::error::Err
         Ok(v) => v.compat(),
         Err(err) => {
             log::error!("Can't create {filename_str}: {:?}", err);
-            return Err(Box::new(err))
-        },
+            return Err(Box::new(err));
+        }
     };
 
     let data = response
@@ -68,8 +64,8 @@ async fn download_file(filename_str: &str) -> Result<(), Box<dyn std::error::Err
         Ok(_) => (),
         Err(err) => {
             log::error!("Can't write data {filename_str}: {}", err);
-            return Err(Box::new(err))
-        },
+            return Err(Box::new(err));
+        }
     };
 
     log::info!("{filename_str} downloaded!");
@@ -148,7 +144,8 @@ where
                 type_: InsertReplaceType::Insert(_),
                 ..
             },
-        )) = ast {
+        )) = ast
+        {
             for value in i.values.into_iter() {
                 for t_value in value.1.into_iter() {
                     let value = T::from_vec_expression(&t_value);
@@ -160,8 +157,8 @@ where
                         }
                         Err(err) => {
                             log::error!("Update error: {:?} : {:?}", value, err);
-                            return Err(err)
-                        },
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -220,30 +217,33 @@ enum UpdateStatus {
 
 async fn send_webhooks() -> Result<(), Box<reqwest::Error>> {
     for webhook in config::CONFIG.webhooks.clone().into_iter() {
-        let Webhook { method, url, headers } = webhook;
+        let Webhook {
+            method,
+            url,
+            headers,
+        } = webhook;
 
         let client = reqwest::Client::new();
 
         let builder = match method {
-            config::Method::Get => {
-                client.get(url)
-            },
-            config::Method::Post => {
-                client.post(url)
-            },
+            config::Method::Get => client.get(url),
+            config::Method::Post => client.post(url),
         };
 
-        let t_headers: Vec<(HeaderName, HeaderValue)> = headers.into_iter().map(|(key, val)| {
-            let value = match val {
-                serde_json::Value::String(v) => v,
-                _ => panic!("Header value not string!")
-            };
+        let t_headers: Vec<(HeaderName, HeaderValue)> = headers
+            .into_iter()
+            .map(|(key, val)| {
+                let value = match val {
+                    serde_json::Value::String(v) => v,
+                    _ => panic!("Header value not string!"),
+                };
 
-            (
-                HeaderName::from_str(key.as_ref()).unwrap(),
-                HeaderValue::from_str(&value).unwrap()
-            )
-        }).collect();
+                (
+                    HeaderName::from_str(key.as_ref()).unwrap(),
+                    HeaderValue::from_str(&value).unwrap(),
+                )
+            })
+            .collect();
 
         let headers = HeaderMap::from_iter(t_headers.into_iter());
 
@@ -258,7 +258,7 @@ async fn send_webhooks() -> Result<(), Box<reqwest::Error>> {
             Ok(_) => (),
             Err(err) => return Err(Box::new(err)),
         };
-    };
+    }
 
     Ok(())
 }
@@ -479,7 +479,7 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         author_annotation_process,
         author_annotation_pics_process,
         genre_annotation_process,
-        book_genre_process
+        book_genre_process,
     ] {
         let process_result = match process.await {
             Ok(v) => v,
@@ -495,11 +495,11 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     match send_webhooks().await {
         Ok(_) => {
             log::info!("Webhooks sended!");
-        },
+        }
         Err(err) => {
             log::info!("Webhooks send failed : {err}");
-            return Err(Box::new(err))
-        },
+            return Err(Box::new(err));
+        }
     };
 
     Ok(())
@@ -508,12 +508,14 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
 pub async fn cron_jobs() {
     let job_scheduler = JobScheduler::new().await.unwrap();
 
-    let update_job = match Job::new_async("0 0 3 * * *", |_uuid, _l| Box::pin(async {
-        match update().await {
-            Ok(_) => log::info!("Updated"),
-            Err(err) => log::info!("Update err: {:?}", err),
-        };
-    })) {
+    let update_job = match Job::new_async("0 0 3 * * *", |_uuid, _l| {
+        Box::pin(async {
+            match update().await {
+                Ok(_) => log::info!("Updated"),
+                Err(err) => log::info!("Update err: {:?}", err),
+            };
+        })
+    }) {
         Ok(v) => v,
         Err(err) => panic!("{:?}", err),
     };
