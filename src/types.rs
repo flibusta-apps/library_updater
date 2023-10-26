@@ -106,6 +106,7 @@ pub struct Book {
     pub uploaded: NaiveDate,
     pub is_deleted: bool,
     pub pages: u64,
+    pub year: u64,
 }
 
 impl FromVecExpression<Book> for Book {
@@ -143,6 +144,10 @@ impl FromVecExpression<Book> for Book {
                 sql_parse::Expression::Integer(v) => v.0,
                 _ => panic!("Book.id"),
             },
+            year: match &value[10] {
+                sql_parse::Expression::Integer(v) => v.0,
+                _ => panic!("Book.year"),
+            },
         }
     }
 }
@@ -154,17 +159,19 @@ impl Update for Book {
             "
             CREATE OR REPLACE FUNCTION update_book(
                 source_ smallint, remote_id_ int, title_ varchar, lang_ varchar,
-                file_type_ varchar, uploaded_ date, is_deleted_ boolean, pages_ int
+                file_type_ varchar, uploaded_ date, is_deleted_ boolean, pages_ int,
+                year_ smallint
             ) RETURNS void AS $$
                 BEGIN
                     IF EXISTS (SELECT * FROM books WHERE source = source_ AND remote_id = remote_id_) THEN
                         UPDATE books SET title = title_, lang = lang_, file_type = file_type_,
-                                         uploaded = uploaded_, is_deleted = is_deleted_, pages = pages_
+                                         uploaded = uploaded_, is_deleted = is_deleted_, pages = pages_,
+                                         year = year_
                         WHERE source = source_ AND remote_id = remote_id_;
                         RETURN;
                     END IF;
-                    INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages)
-                        VALUES (source_, remote_id_, title_, lang_, file_type_, uploaded_, is_deleted_, pages_);
+                    INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages, year)
+                        VALUES (source_, remote_id_, title_, lang_, file_type_, uploaded_, is_deleted_, pages_, year_);
                 END;
             $$ LANGUAGE plpgsql;
             "
@@ -180,8 +187,8 @@ impl Update for Book {
         source_id: i16,
     ) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
-            "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8);",
-            &[&source_id, &(self.id as i32), &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &(self.pages as i32)]
+            "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8, $9);",
+            &[&source_id, &(self.id as i32), &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &(self.pages as i32), &(self.year as i32)]
         ).await {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
