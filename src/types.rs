@@ -188,7 +188,7 @@ impl Update for Book {
     ) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8, $9);",
-            &[&source_id, &(self.id as i32), &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &(self.pages as i32), &(self.year as i32)]
+            &[&source_id, &(self.id as i32), &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &(self.pages as i32), &(self.year as i16)]
         ).await {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
