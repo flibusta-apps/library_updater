@@ -146,6 +146,7 @@ impl FromVecExpression<Book> for Book {
             },
             year: match &value[10] {
                 sql_parse::Expression::Integer(v) => v.0,
+                sql_parse::Expression::Unary { .. } => 0,
                 _ => panic!("Book.year"),
             },
         }
