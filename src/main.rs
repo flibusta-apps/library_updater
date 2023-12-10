@@ -47,10 +47,8 @@ async fn start_app() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
     log::info!("Start webserver...");
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
     log::info!("Webserver shutdown...")
 }
 
