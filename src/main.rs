@@ -7,6 +7,7 @@ pub mod updater;
 pub mod utils;
 
 use axum::{http::HeaderMap, routing::post, Router};
+use dotenv::dotenv;
 use sentry::{integrations::debug_images::DebugImagesIntegration, types::Dsn, ClientOptions};
 use std::{net::SocketAddr, str::FromStr};
 use tower_http::trace::{self, TraceLayer};
@@ -54,6 +55,8 @@ async fn start_app() {
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_target(false)
         .compact()

@@ -15,7 +15,10 @@ RUN apt-get update \
 
 RUN update-ca-certificates
 
+COPY ./scripts/*.sh /
+RUN chmod +x /*.sh
+
 WORKDIR /app
 
 COPY --from=builder /app/target/release/library_updater /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/library_updater"]
+ENTRYPOINT ["/start.sh"]
