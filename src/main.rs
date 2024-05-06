@@ -9,10 +9,14 @@ pub mod utils;
 use axum::{http::HeaderMap, routing::post, Router};
 use dotenv::dotenv;
 use sentry::{integrations::debug_images::DebugImagesIntegration, types::Dsn, ClientOptions};
+use sentry_tracing::EventFilter;
 use std::{net::SocketAddr, str::FromStr};
 use tower_http::trace::{self, TraceLayer};
 use tracing::log;
 use tracing::Level;
+use tracing_subscriber::filter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::updater::cron_jobs;
 
@@ -57,11 +61,6 @@ async fn start_app() {
 async fn main() {
     dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .compact()
-        .init();
-
     let options = ClientOptions {
         dsn: Some(Dsn::from_str(&config::CONFIG.sentry_dsn).unwrap()),
         default_integrations: false,
@@ -70,6 +69,17 @@ async fn main() {
     .add_integration(DebugImagesIntegration::new());
 
     let _guard = sentry::init(options);
+
+    let sentry_layer = sentry_tracing::layer().event_filter(|md| match md.level() {
+        &tracing::Level::ERROR => EventFilter::Event,
+        _ => EventFilter::Ignore,
+    });
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(filter::LevelFilter::INFO)
+        .with(sentry_layer)
+        .init();
 
     tokio::join![cron_jobs(), start_app()];
 }
