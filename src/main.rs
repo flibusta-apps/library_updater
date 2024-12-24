@@ -7,7 +7,7 @@ pub mod updater;
 pub mod utils;
 
 use axum::{http::HeaderMap, routing::post, Router};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use sentry::{integrations::debug_images::DebugImagesIntegration, types::Dsn, ClientOptions};
 use sentry_tracing::EventFilter;
 use std::{net::SocketAddr, str::FromStr};

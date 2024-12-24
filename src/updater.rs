@@ -18,8 +18,8 @@ use crate::types::{
 };
 use crate::utils::read_lines;
 use sql_parse::{
-    parse_statement, InsertReplace, InsertReplaceType, ParseOptions, SQLArguments, SQLDialect,
-    Statement,
+    parse_statement, InsertReplace, InsertReplaceType, Issues, ParseOptions, SQLArguments,
+    SQLDialect, Statement,
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -136,7 +136,7 @@ where
             Err(err) => return Err(Box::new(err)),
         };
 
-        let mut issues = Vec::new();
+        let mut issues = Issues::new(&line);
         let ast = parse_statement(&line, &mut issues, &parse_options);
 
         if let Some(Statement::InsertReplace(
