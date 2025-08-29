@@ -39,7 +39,7 @@ ammonia = "4.0.0"
 maplit = "1.0.2"
 
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"]}
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"]}
 sentry-tracing = "0.41.0"
 
 tower-http = { version = "0.6.2", features = ["trace"] }
