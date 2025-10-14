@@ -55,7 +55,7 @@ async fn download_file(filename_str: &str) -> Result<(), Box<dyn std::error::Err
 
     let data = response
         .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(std::io::Error::other)
         .into_async_read();
 
     let decoder = GzipDecoder::new(data);
