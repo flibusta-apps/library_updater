@@ -828,25 +828,28 @@ impl FromVecExpression<Genre> for Genre {
 #[async_trait]
 impl Update for Genre {
     async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
-        match client.execute(
-            "
+        match client
+            .execute(
+                "
             CREATE OR REPLACE FUNCTION update_genre(
                 source_ smallint, remote_id_ int, code_ varchar, description_ varchar, meta_ varchar
             ) RETURNS void AS $$
                 BEGIN
-                    IF EXISTS (SELECT * FROM genres WHERE source = source_ AND remote_id = remote_id_) THEN
-                        UPDATE genres SET code = code_, description = description_, meta = meta_
-                        WHERE source = source_ AND remote_id = remote_id_;
-                        RETURN;
-                    END IF;
                     INSERT INTO genres (source, remote_id, code, description, meta)
-                        VALUES (source_, remote_id_, code_, description_, meta_);
+                        VALUES (source_, remote_id_, code_, description_, meta_)
+                    ON CONFLICT (source, remote_id) DO UPDATE SET
+                        code = EXCLUDED.code,
+                        description = EXCLUDED.description,
+                        meta = EXCLUDED.meta;
                 END;
             $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
+            ",
+                &[],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => Err(Box::new(err)),
         }
     }
 
