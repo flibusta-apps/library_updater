@@ -830,7 +830,6 @@ impl Update for Genre {
     async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
-            DROP FUNCTION IF EXISTS update_genre(smallint, integer, character varying, character varying, character varying);
             CREATE OR REPLACE FUNCTION update_genre(
                 source_ smallint, remote_id_ int, code_ varchar, description_ varchar, meta_ varchar
             ) RETURNS void AS $$
