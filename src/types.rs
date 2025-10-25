@@ -830,22 +830,17 @@ impl Update for Genre {
     async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
         match client.execute(
             "
-            CREATE OR REPLACE FUNCTION update_book_sequence(source_ smallint, book_ integer, genre_ integer) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                    genre_id integer := -1;
+            CREATE OR REPLACE FUNCTION update_genre(
+                source_ smallint, remote_id_ int, code_ varchar, description_ varchar, meta_ varchar
+            ) RETURNS void AS $$
                 BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
-
-                    IF book_id IS NULL THEN
+                    IF EXISTS (SELECT * FROM genres WHERE source = source_ AND remote_id = remote_id_) THEN
+                        UPDATE genres SET code = code_, description = description_, meta = meta_
+                        WHERE source = source_ AND remote_id = remote_id_;
                         RETURN;
                     END IF;
-
-                    SELECT id INTO genre_id FROM genres WHERE source = source_ AND remote_id = genre_;
-                    IF EXISTS (SELECT * FROM book_genres WHERE book = book_id AND genre = genre_id) THEN
-                        RETURN;
-                    END IF;
-                    INSERT INTO book_genres (book, genre) VALUES (book_id, genre_id);
+                    INSERT INTO genres (source, remote_id, code, description, meta)
+                        VALUES (source_, remote_id_, code_, description_, meta_);
                 END;
             $$ LANGUAGE plpgsql;
             "
