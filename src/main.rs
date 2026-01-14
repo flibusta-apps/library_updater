@@ -20,6 +20,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::updater::cron_jobs;
 
+async fn health() -> &'static str {
+    "OK"
+}
+
 async fn update(headers: HeaderMap) -> &'static str {
     let config_api_key = config::CONFIG.api_key.clone();
 
@@ -43,11 +47,14 @@ async fn update(headers: HeaderMap) -> &'static str {
 }
 
 async fn start_app() {
-    let app = Router::new().route("/update", post(update)).layer(
-        TraceLayer::new_for_http()
-            .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
-            .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
-    );
+    let app = Router::new()
+        .route("/health", axum::routing::get(health))
+        .route("/update", post(update))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+        );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
 
