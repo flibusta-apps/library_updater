@@ -28,7 +28,8 @@ pub fn fix_annotation_text(text: &str) -> String {
     let mut temp_text = text
         .replace("<br>", "\n")
         .replace("\\n", "\n")
-        .replace("\\\"", "\"");
+        .replace("\\\"", "\"")
+        .replace("&nbsp;", " ");
 
     while temp_text.contains("  ") {
         temp_text = temp_text.replace("  ", " ");
@@ -56,6 +57,16 @@ mod tests {
     fn test_fix_annotation_text_replace_br() {
         let input = "a<br>b";
         let expected_result = "a\nb";
+
+        let result = fix_annotation_text(input);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_fix_annotation_text_replace_nbsp() {
+        let input = "a&nbsp;b";
+        let expected_result = "a b";
 
         let result = fix_annotation_text(input);
 
