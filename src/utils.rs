@@ -29,7 +29,8 @@ pub fn fix_annotation_text(text: &str) -> String {
         .replace("<br>", "\n")
         .replace("\\n", "\n")
         .replace("\\\"", "\"")
-        .replace("&nbsp;", " ");
+        .replace("&nbsp;", " ")
+        .replace("\u{00A0}", " ");
 
     while temp_text.contains("  ") {
         temp_text = temp_text.replace("  ", " ");
@@ -66,6 +67,16 @@ mod tests {
     #[test]
     fn test_fix_annotation_text_replace_nbsp() {
         let input = "a&nbsp;b";
+        let expected_result = "a b";
+
+        let result = fix_annotation_text(input);
+
+        assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn test_fix_annotation_text_replace_unicode_nbsp() {
+        let input = "a\u{00A0}b";
         let expected_result = "a b";
 
         let result = fix_annotation_text(input);
