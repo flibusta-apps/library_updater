@@ -10,7 +10,7 @@ RUN cargo build --release --bin library_updater
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y openssl ca-certificates curl jq \
+    && apt-get install -y openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN update-ca-certificates
