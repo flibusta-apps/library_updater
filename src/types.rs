@@ -488,12 +488,12 @@ impl Update for Translator {
                     author_id integer := -1;
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+                    SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
 
                     IF book_id IS NULL OR author_id IS NULL THEN
                         RETURN;
                     END IF;
 
-                    SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
                     IF EXISTS (SELECT * FROM translations WHERE book = book_id AND author = author_id) THEN
                         UPDATE translations SET position = position_
                         WHERE book = book_id AND author = author_id;
@@ -803,12 +803,13 @@ impl Update for BookAnnotation {
                     book_id integer := -1;
                 BEGIN
                     SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
-                    IF EXISTS (SELECT * FROM book_annotations WHERE book = book_id) THEN
-                        UPDATE book_annotations SET title = title_, text = text_ WHERE book = book_id;
+
+                    IF book_id IS NULL THEN
                         RETURN;
                     END IF;
 
-                    IF book_id IS NULL THEN
+                    IF EXISTS (SELECT * FROM book_annotations WHERE book = book_id) THEN
+                        UPDATE book_annotations SET title = title_, text = text_ WHERE book = book_id;
                         RETURN;
                     END IF;
 
@@ -975,6 +976,11 @@ impl Update for AuthorAnnotation {
                     author_id integer := -1;
                 BEGIN
                     SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
+
+                    IF author_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
                     IF EXISTS (SELECT * FROM author_annotations WHERE author = author_id) THEN
                         UPDATE author_annotations SET title = title_, text = text_ WHERE author = author_id;
                         RETURN;
@@ -1229,8 +1235,33 @@ impl FromVecExpression<BookGenre> for BookGenre {
 
 #[async_trait]
 impl Update for BookGenre {
-    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
+        match client.execute(
+            "
+            CREATE OR REPLACE FUNCTION update_book_genre(source_ smallint, book_ integer, genre_ integer) RETURNS void AS $$
+                DECLARE
+                    book_id integer := -1;
+                    genre_id integer := -1;
+                BEGIN
+                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+                    SELECT id INTO genre_id FROM genres WHERE source = source_ AND remote_id = genre_;
+
+                    IF book_id IS NULL OR genre_id IS NULL THEN
+                        RETURN;
+                    END IF;
+
+                    IF EXISTS (SELECT * FROM book_genres WHERE book = book_id AND genre = genre_id) THEN
+                        RETURN;
+                    END IF;
+
+                    INSERT INTO book_genres (book, genre) VALUES (book_id, genre_id);
+                END;
+            $$ LANGUAGE plpgsql;
+            "
+            , &[]).await {
+                Ok(_) => Ok(()),
+                Err(err) => Err(Box::new(err)),
+        }
     }
 
     async fn update(
@@ -1245,7 +1276,7 @@ impl Update for BookGenre {
 
         match client
             .execute(
-                "SELECT update_book_sequence($1, $2, $3);",
+                "SELECT update_book_genre($1, $2, $3);",
                 &[&source_id, &book_id, &genre_id],
             )
             .await

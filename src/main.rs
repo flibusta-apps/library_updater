@@ -1,13 +1,9 @@
-#[macro_use]
-extern crate lazy_static;
-
-pub mod config;
-pub mod types;
-pub mod updater;
-pub mod utils;
-
 use axum::{http::HeaderMap, routing::post, Router};
 use dotenvy::dotenv;
+use library_updater::{
+    config,
+    updater::{self, cron_jobs},
+};
 use sentry::{integrations::debug_images::DebugImagesIntegration, types::Dsn, ClientOptions};
 use sentry_tracing::EventFilter;
 use std::{net::SocketAddr, str::FromStr};
@@ -17,8 +13,6 @@ use tracing::Level;
 use tracing_subscriber::filter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-use crate::updater::cron_jobs;
 
 async fn health() -> &'static str {
     "OK"
