@@ -29,6 +29,8 @@ async fn status() -> axum::Json<serde_json::Value> {
         "rows_processed_total": snap.rows_processed_total,
         "rows_skipped_total": snap.rows_skipped_total,
         "errors_total": snap.errors_total,
+        "webhook_errors_total": snap.webhook_errors_total,
+        "last_webhook_error": snap.last_webhook_error,
     }))
 }
 
@@ -49,12 +51,16 @@ update_rows_processed_total {}\n\
 update_rows_skipped_total {}\n\
 # HELP update_errors_total Total failed update runs\n\
 # TYPE update_errors_total counter\n\
-update_errors_total {}\n",
+update_errors_total {}\n\
+# HELP update_webhook_errors_total Total webhook delivery failures across all update runs\n\
+# TYPE update_webhook_errors_total counter\n\
+update_webhook_errors_total {}\n",
         if snap.running { 1 } else { 0 },
         snap.last_success_at,
         snap.rows_processed_total,
         snap.rows_skipped_total,
         snap.errors_total,
+        snap.webhook_errors_total,
     )
 }
 

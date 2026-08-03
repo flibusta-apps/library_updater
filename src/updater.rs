@@ -277,37 +277,78 @@ enum UpdateStatus {
     Fail,
 }
 
-async fn send_webhooks() -> Result<(), Box<reqwest::Error>> {
-    for webhook in config::CONFIG.webhooks.clone().into_iter() {
+const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
+const WEBHOOK_RETRY_BACKOFFS_MS: [u64; 2] = [500, 1500];
+
+async fn send_webhooks() -> Result<(), String> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = format!("failed to build webhook http client: {err}");
+            log::error!("{msg}");
+            return Err(msg);
+        }
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for webhook in config::CONFIG.webhooks.iter() {
         let Webhook {
             method,
             url,
             headers,
-        } = webhook;
+        } = webhook.clone();
 
-        let client = reqwest::Client::new();
+        let mut last_error: Option<String> = None;
 
-        let builder = match method {
-            config::Method::Get => client.get(url),
-            config::Method::Post => client.post(url),
-        };
+        for attempt in 0..WEBHOOK_MAX_ATTEMPTS {
+            let builder = match method {
+                config::Method::Get => client.get(url.clone()),
+                config::Method::Post => client.post(url.clone()),
+            };
 
-        let headers = HeaderMap::from_iter(headers);
+            let request_headers = HeaderMap::from_iter(headers.clone());
 
-        let response = builder.headers(headers).send().await;
+            let response = builder.headers(request_headers).send().await;
 
-        let response = match response {
-            Ok(v) => v,
-            Err(err) => return Err(Box::new(err)),
-        };
+            let attempt_result = match response {
+                Ok(v) => match v.error_for_status() {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err.to_string()),
+                },
+                Err(err) => Err(err.to_string()),
+            };
 
-        match response.error_for_status() {
-            Ok(_) => (),
-            Err(err) => return Err(Box::new(err)),
-        };
+            match attempt_result {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < WEBHOOK_MAX_ATTEMPTS - 1 {
+                        let backoff_ms = WEBHOOK_RETRY_BACKOFFS_MS[attempt as usize];
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            let msg = format!("webhook {url} failed: {err}");
+            log::error!("{msg}");
+            failures.push(msg);
+        }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 lazy_static! {
@@ -323,6 +364,8 @@ pub struct RunState {
     pub rows_processed_total: AtomicU64,
     pub rows_skipped_total: AtomicU64,
     pub errors_total: AtomicU64,
+    pub webhook_errors_total: AtomicU64,
+    pub last_webhook_error: std::sync::RwLock<Option<String>>,
 }
 
 pub struct StatusSnapshot {
@@ -334,6 +377,8 @@ pub struct StatusSnapshot {
     pub rows_processed_total: u64,
     pub rows_skipped_total: u64,
     pub errors_total: u64,
+    pub webhook_errors_total: u64,
+    pub last_webhook_error: Option<String>,
 }
 
 impl RunState {
@@ -347,6 +392,8 @@ impl RunState {
             rows_processed_total: AtomicU64::new(0),
             rows_skipped_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
+            webhook_errors_total: AtomicU64::new(0),
+            last_webhook_error: std::sync::RwLock::new(None),
         }
     }
 
@@ -376,6 +423,8 @@ impl RunState {
             rows_processed_total: self.rows_processed_total.load(Ordering::SeqCst),
             rows_skipped_total: self.rows_skipped_total.load(Ordering::SeqCst),
             errors_total: self.errors_total.load(Ordering::SeqCst),
+            webhook_errors_total: self.webhook_errors_total.load(Ordering::SeqCst),
+            last_webhook_error: self.last_webhook_error.read().unwrap().clone(),
         }
     }
 }
@@ -562,11 +611,15 @@ async fn run_update_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     match send_webhooks().await {
         Ok(_) => {
+            *RUN_STATE.last_webhook_error.write().unwrap() = None;
             log::info!("Webhooks sended!");
         }
         Err(err) => {
-            log::error!("Webhooks send failed : {err}");
-            return Err(Box::new(err));
+            RUN_STATE
+                .webhook_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            *RUN_STATE.last_webhook_error.write().unwrap() = Some(err.clone());
+            log::error!("Webhook delivery failed after successful DB update: {err}");
         }
     };
 
