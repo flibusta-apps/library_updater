@@ -2,24 +2,59 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use sql_parse::Expression;
 use tokio_postgres::Client;
+use tracing::log;
 
 use crate::utils::{fix_annotation_text, parse_lang, remove_wrong_chars};
 
 pub trait FromVecExpression<T> {
-    fn from_vec_expression(value: &[Expression]) -> T;
+    fn from_vec_expression(value: &[Expression]) -> Result<T, ParseError>;
+}
+
+#[derive(Debug)]
+pub struct ParseError {
+    pub type_name: &'static str,
+    pub field: &'static str,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to parse {}.{}: {}",
+            self.type_name, self.field, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Parse a Flibusta `Time` string into a `NaiveDate`.
+///
+/// Falls back to a sentinel date (`1970-01-01`) with a logged warning if the
+/// value doesn't match the expected format (known Flibusta oddities include
+/// `0000-00-00 00:00:00` and date-only values).
+fn parse_book_date(s: &str) -> NaiveDate {
+    match NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        Ok(dt) => dt.date(),
+        Err(_) => {
+            log::warn!("Book.uploaded: unparseable date {:?}, using sentinel", s);
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+        }
+    }
 }
 
 #[async_trait]
 pub trait Update {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>>;
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>>;
 
     async fn update(
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>>;
+    ) -> Result<(), Box<dyn std::error::Error + Send>>;
 
-    async fn after_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>>;
+    async fn after_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>>;
 }
 
 #[derive(Debug)]
@@ -31,31 +66,60 @@ pub struct Author {
 }
 
 impl FromVecExpression<Author> for Author {
-    fn from_vec_expression(value: &[Expression]) -> Author {
-        Author {
-            id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Author.id"),
-            },
-            last_name: match &value[3] {
-                sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
-                _ => panic!("Author.last_name"),
-            },
-            first_name: match &value[1] {
-                sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
-                _ => panic!("Author.first_name"),
-            },
-            middle_name: match &value[2] {
-                sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
-                _ => panic!("Author.middle_name"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<Author, ParseError> {
+        let id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Author",
+                    field: "id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let last_name = match &value[3] {
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Author",
+                    field: "last_name",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let first_name = match &value[1] {
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Author",
+                    field: "first_name",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let middle_name = match &value[2] {
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Author",
+                    field: "middle_name",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(Author {
+            id,
+            last_name,
+            first_name,
+            middle_name,
+        })
     }
 }
 
 #[async_trait]
 impl Update for Author {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_author(
@@ -82,17 +146,20 @@ impl Update for Author {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let id =
+            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client.execute(
             "SELECT update_author($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-            &[&source_id, &(self.id as i32), &self.first_name, &self.last_name, &self.middle_name]
+            &[&source_id, &id, &self.first_name, &self.last_name, &self.middle_name]
         ).await {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -110,52 +177,105 @@ pub struct Book {
 }
 
 impl FromVecExpression<Book> for Book {
-    fn from_vec_expression(value: &[Expression]) -> Book {
-        Book {
-            id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Book.id"),
-            },
-            title: match &value[3] {
-                sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
-                _ => panic!("Book.title"),
-            },
-            lang: match &value[5] {
-                sql_parse::Expression::String(v) => parse_lang(&v.value),
-                _ => panic!("Book.lang"),
-            },
-            file_type: match &value[8] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("Book.file_type"),
-            },
-            uploaded: match &value[2] {
-                sql_parse::Expression::String(v) => {
-                    NaiveDateTime::parse_from_str(&v.value, "%Y-%m-%d %H:%M:%S")
-                        .unwrap()
-                        .date()
-                }
-                _ => panic!("Book.uploaded"),
-            },
-            is_deleted: match &value[11] {
-                sql_parse::Expression::String(v) => v.value.eq("1"),
-                _ => panic!("Book.is_deleted"),
-            },
-            pages: match &value[20] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Book.id"),
-            },
-            year: match &value[10] {
-                sql_parse::Expression::Integer(v) => v.0,
-                sql_parse::Expression::Unary { .. } => 0,
-                _ => panic!("Book.year"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<Book, ParseError> {
+        let id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let title = match &value[3] {
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "title",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let lang = match &value[5] {
+            sql_parse::Expression::String(v) => parse_lang(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "lang",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let file_type = match &value[8] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "file_type",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let uploaded = match &value[2] {
+            sql_parse::Expression::String(v) => parse_book_date(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "uploaded",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let is_deleted = match &value[11] {
+            sql_parse::Expression::String(v) => v.value.eq("1"),
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "is_deleted",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let pages = match &value[20] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "pages",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let year = match &value[10] {
+            sql_parse::Expression::Integer(v) => v.0,
+            sql_parse::Expression::Unary { .. } => 0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Book",
+                    field: "year",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(Book {
+            id,
+            title,
+            lang,
+            file_type,
+            uploaded,
+            is_deleted,
+            pages,
+            year,
+        })
     }
 }
 
 #[async_trait]
 impl Update for Book {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book(
@@ -186,17 +306,24 @@ impl Update for Book {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let id =
+            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let pages = i32::try_from(self.pages)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let year = i16::try_from(self.year)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client.execute(
             "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8, $9);",
-            &[&source_id, &(self.id as i32), &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &(self.pages as i32), &(self.year as i16)]
+            &[&source_id, &id, &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &pages, &year]
         ).await {
             Ok(_) => Ok(()),
             Err(err) => Err(Box::new(err)),
         }
     }
 
-    async fn after_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client
             .execute(
                 "UPDATE books SET is_deleted = 't' WHERE lang NOT IN ('ru', 'be', 'uk');",
@@ -218,23 +345,35 @@ pub struct BookAuthor {
 }
 
 impl FromVecExpression<BookAuthor> for BookAuthor {
-    fn from_vec_expression(value: &[Expression]) -> BookAuthor {
-        BookAuthor {
-            book_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookAuthor.book_id"),
-            },
-            author_id: match &value[1] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookAuthor.author_id"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<BookAuthor, ParseError> {
+        let book_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAuthor",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let author_id = match &value[1] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAuthor",
+                    field: "author_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(BookAuthor { book_id, author_id })
     }
 }
 
 #[async_trait]
 impl Update for BookAuthor {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_author(source_ smallint, book_ integer, author_ integer) RETURNS void AS $$
@@ -267,11 +406,16 @@ impl Update for BookAuthor {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let author_id = i32::try_from(self.author_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_book_author($1, $2, $3);",
-                &[&source_id, &(self.book_id as i32), &(self.author_id as i32)],
+                &[&source_id, &book_id, &author_id],
             )
             .await
         {
@@ -280,7 +424,7 @@ impl Update for BookAuthor {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -293,27 +437,49 @@ pub struct Translator {
 }
 
 impl FromVecExpression<Translator> for Translator {
-    fn from_vec_expression(value: &[Expression]) -> Translator {
-        Translator {
-            book_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Translator.book_id"),
-            },
-            author_id: match &value[1] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Translator.author_id"),
-            },
-            position: match &value[2] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Translator.pos"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<Translator, ParseError> {
+        let book_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Translator",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let author_id = match &value[1] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Translator",
+                    field: "author_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let position = match &value[2] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Translator",
+                    field: "position",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(Translator {
+            book_id,
+            author_id,
+            position,
+        })
     }
 }
 
 #[async_trait]
 impl Update for Translator {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_translation(source_ smallint, book_ integer, author_ integer, position_ smallint) RETURNS void AS $$
@@ -347,16 +513,18 @@ impl Update for Translator {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let author_id = i32::try_from(self.author_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let position = i16::try_from(self.position)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_translation($1, $2, $3, $4);",
-                &[
-                    &source_id,
-                    &(self.book_id as i32),
-                    &(self.author_id as i32),
-                    &(self.position as i16),
-                ],
+                &[&source_id, &book_id, &author_id, &position],
             )
             .await
         {
@@ -365,7 +533,7 @@ impl Update for Translator {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -377,23 +545,35 @@ pub struct Sequence {
 }
 
 impl FromVecExpression<Sequence> for Sequence {
-    fn from_vec_expression(value: &[Expression]) -> Sequence {
-        Sequence {
-            id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Sequence.id"),
-            },
-            name: match &value[1] {
-                sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
-                _ => panic!("Sequence.name"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<Sequence, ParseError> {
+        let id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Sequence",
+                    field: "id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let name = match &value[1] {
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            other => {
+                return Err(ParseError {
+                    type_name: "Sequence",
+                    field: "name",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(Sequence { id, name })
     }
 }
 
 #[async_trait]
 impl Update for Sequence {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_sequences(source_ smallint, remote_id_ int, name_ varchar) RETURNS void AS $$
@@ -416,11 +596,14 @@ impl Update for Sequence {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let id =
+            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_sequences($1, $2, cast($3 as varchar));",
-                &[&source_id, &(self.id as i32), &self.name],
+                &[&source_id, &id, &self.name],
             )
             .await
         {
@@ -429,7 +612,7 @@ impl Update for Sequence {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -442,35 +625,63 @@ pub struct SequenceInfo {
 }
 
 impl FromVecExpression<SequenceInfo> for SequenceInfo {
-    fn from_vec_expression(value: &[Expression]) -> SequenceInfo {
-        SequenceInfo {
-            book_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("SequenceInfo.book_id"),
+    fn from_vec_expression(value: &[Expression]) -> Result<SequenceInfo, ParseError> {
+        let book_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "SequenceInfo",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let sequence_id = match &value[1] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "SequenceInfo",
+                    field: "sequence_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let position = match &value[2] {
+            sql_parse::Expression::Integer(v) => v.0,
+            sql_parse::Expression::Unary {
+                op,
+                op_span: _,
+                operand,
+            } => match (op, operand.as_ref()) {
+                (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => v.0,
+                (_, _) => {
+                    return Err(ParseError {
+                        type_name: "SequenceInfo",
+                        field: "position",
+                        detail: format!("{:?}", &value[2]),
+                    })
+                }
             },
-            sequence_id: match &value[1] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("SequenceInfo.sequence_id"),
-            },
-            position: match &value[2] {
-                sql_parse::Expression::Integer(v) => v.0,
-                sql_parse::Expression::Unary {
-                    op,
-                    op_span: _,
-                    operand,
-                } => match (op, operand.as_ref()) {
-                    (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => v.0,
-                    (_, _) => panic!("SequenceInfo.position = {:?}", &value[2]),
-                },
-                _ => panic!("SequenceInfo.position = {:?}", &value[2]),
-            },
-        }
+            other => {
+                return Err(ParseError {
+                    type_name: "SequenceInfo",
+                    field: "position",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(SequenceInfo {
+            book_id,
+            sequence_id,
+            position,
+        })
     }
 }
 
 #[async_trait]
 impl Update for SequenceInfo {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_sequence(source_ smallint, book_ integer, sequence_ integer, position_ smallint) RETURNS void AS $$
@@ -508,16 +719,18 @@ impl Update for SequenceInfo {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let sequence_id = i32::try_from(self.sequence_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let position = i16::try_from(self.position)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_book_sequence($1, $2, $3, $4);",
-                &[
-                    &source_id,
-                    &(self.book_id as i32),
-                    &(self.sequence_id as i32),
-                    &(self.position as i16),
-                ],
+                &[&source_id, &book_id, &sequence_id, &position],
             )
             .await
         {
@@ -526,7 +739,7 @@ impl Update for SequenceInfo {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -539,28 +752,50 @@ pub struct BookAnnotation {
 }
 
 impl FromVecExpression<BookAnnotation> for BookAnnotation {
-    fn from_vec_expression(value: &[Expression]) -> BookAnnotation {
-        BookAnnotation {
-            book_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookAnnotation.book_id"),
-            },
-            title: match &value[2] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("BookAnnotation.title"),
-            },
-            body: match &value[3] {
-                sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
-                sql_parse::Expression::Null(_) => None,
-                _ => panic!("BookAnnotation.body"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<BookAnnotation, ParseError> {
+        let book_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAnnotation",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let title = match &value[2] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAnnotation",
+                    field: "title",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let body = match &value[3] {
+            sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
+            sql_parse::Expression::Null(_) => None,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAnnotation",
+                    field: "body",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(BookAnnotation {
+            book_id,
+            title,
+            body,
+        })
     }
 }
 
 #[async_trait]
 impl Update for BookAnnotation {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_book_annotation(source_ smallint, book_ integer, title_ varchar, text_ text) RETURNS void AS $$
@@ -591,11 +826,14 @@ impl Update for BookAnnotation {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_book_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                &[&source_id, &(self.book_id as i32), &self.title, &self.body],
+                &[&source_id, &book_id, &self.title, &self.body],
             )
             .await
         {
@@ -604,7 +842,7 @@ impl Update for BookAnnotation {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -616,23 +854,35 @@ pub struct BookAnnotationPic {
 }
 
 impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
-    fn from_vec_expression(value: &[Expression]) -> BookAnnotationPic {
-        BookAnnotationPic {
-            book_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookAnnotationPic.book_id"),
-            },
-            file: match &value[2] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("BookAnnotationPic.file"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<BookAnnotationPic, ParseError> {
+        let book_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAnnotationPic",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let file = match &value[2] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "BookAnnotationPic",
+                    field: "file",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(BookAnnotationPic { book_id, file })
     }
 }
 
 #[async_trait]
 impl Update for BookAnnotationPic {
-    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 
@@ -640,7 +890,10 @@ impl Update for BookAnnotationPic {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "\
@@ -649,7 +902,7 @@ SET file = cast($3 as varchar) \
 FROM (SELECT id FROM books WHERE source = $1 AND remote_id = $2) as books \
 WHERE book = books.id;\
             ",
-                &[&source_id, &(self.book_id as i32), &self.file],
+                &[&source_id, &book_id, &self.file],
             )
             .await
         {
@@ -658,7 +911,7 @@ WHERE book = books.id;\
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -671,28 +924,50 @@ pub struct AuthorAnnotation {
 }
 
 impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
-    fn from_vec_expression(value: &[Expression]) -> AuthorAnnotation {
-        AuthorAnnotation {
-            author_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("AuthorAnnotation.author_id"),
-            },
-            title: match &value[2] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("AuthorAnnotation.title"),
-            },
-            body: match &value[3] {
-                sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
-                sql_parse::Expression::Null(_) => None,
-                _ => panic!("AuthorAnnotation.body"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<AuthorAnnotation, ParseError> {
+        let author_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "AuthorAnnotation",
+                    field: "author_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let title = match &value[2] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "AuthorAnnotation",
+                    field: "title",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let body = match &value[3] {
+            sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
+            sql_parse::Expression::Null(_) => None,
+            other => {
+                return Err(ParseError {
+                    type_name: "AuthorAnnotation",
+                    field: "body",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(AuthorAnnotation {
+            author_id,
+            title,
+            body,
+        })
     }
 }
 
 #[async_trait]
 impl Update for AuthorAnnotation {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client.execute(
             "
             CREATE OR REPLACE FUNCTION update_author_annotation(source_ smallint, author_ integer, title_ varchar, text_ text) RETURNS void AS $$
@@ -718,16 +993,14 @@ impl Update for AuthorAnnotation {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let author_id = i32::try_from(self.author_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_author_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                &[
-                    &source_id,
-                    &(self.author_id as i32),
-                    &self.title,
-                    &self.body,
-                ],
+                &[&source_id, &author_id, &self.title, &self.body],
             )
             .await
         {
@@ -736,7 +1009,7 @@ impl Update for AuthorAnnotation {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -748,23 +1021,35 @@ pub struct AuthorAnnotationPic {
 }
 
 impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
-    fn from_vec_expression(value: &[Expression]) -> AuthorAnnotationPic {
-        AuthorAnnotationPic {
-            author_id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("AuthorAnnotationPic.book_id"),
-            },
-            file: match &value[2] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("AuthorAnnotationPic.file"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<AuthorAnnotationPic, ParseError> {
+        let author_id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "AuthorAnnotationPic",
+                    field: "author_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let file = match &value[2] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "AuthorAnnotationPic",
+                    field: "file",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(AuthorAnnotationPic { author_id, file })
     }
 }
 
 #[async_trait]
 impl Update for AuthorAnnotationPic {
-    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 
@@ -772,7 +1057,10 @@ impl Update for AuthorAnnotationPic {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let author_id = i32::try_from(self.author_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "\
@@ -780,7 +1068,7 @@ UPDATE author_annotations \
 SET file = cast($3 as varchar) \
 FROM (SELECT id FROM authors WHERE source = $1 AND remote_id = $2) as authors \
 WHERE author = authors.id;",
-                &[&source_id, &(self.author_id as i32), &self.file],
+                &[&source_id, &author_id, &self.file],
             )
             .await
         {
@@ -789,7 +1077,7 @@ WHERE author = authors.id;",
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -803,31 +1091,60 @@ pub struct Genre {
 }
 
 impl FromVecExpression<Genre> for Genre {
-    fn from_vec_expression(value: &[Expression]) -> Genre {
-        Genre {
-            id: match &value[0] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("Genre.id"),
-            },
-            code: match &value[1] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("Genre.code = {:?}", &value[1]),
-            },
-            description: match &value[2] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("Genre.description = {:?}", &value[2]),
-            },
-            meta: match &value[3] {
-                sql_parse::Expression::String(v) => v.value.to_string(),
-                _ => panic!("Genre.meta"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<Genre, ParseError> {
+        let id = match &value[0] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "Genre",
+                    field: "id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let code = match &value[1] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "Genre",
+                    field: "code",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let description = match &value[2] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "Genre",
+                    field: "description",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let meta = match &value[3] {
+            sql_parse::Expression::String(v) => v.value.to_string(),
+            other => {
+                return Err(ParseError {
+                    type_name: "Genre",
+                    field: "meta",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(Genre {
+            id,
+            code,
+            description,
+            meta,
+        })
     }
 }
 
 #[async_trait]
 impl Update for Genre {
-    async fn before_update(client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         match client
             .execute(
                 "
@@ -857,11 +1174,14 @@ impl Update for Genre {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let id =
+            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_genre($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-                &[&source_id, &(self.id as i32), &self.code, &self.description, &self.meta]
+                &[&source_id, &id, &self.code, &self.description, &self.meta]
             ).await
         {
             Ok(_) => Ok(()),
@@ -869,7 +1189,7 @@ impl Update for Genre {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 }
@@ -881,23 +1201,35 @@ pub struct BookGenre {
 }
 
 impl FromVecExpression<BookGenre> for BookGenre {
-    fn from_vec_expression(value: &[Expression]) -> BookGenre {
-        BookGenre {
-            book_id: match &value[1] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookGenre.book_id"),
-            },
-            genre_id: match &value[2] {
-                sql_parse::Expression::Integer(v) => v.0,
-                _ => panic!("BookGenre.genre_id"),
-            },
-        }
+    fn from_vec_expression(value: &[Expression]) -> Result<BookGenre, ParseError> {
+        let book_id = match &value[1] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookGenre",
+                    field: "book_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+        let genre_id = match &value[2] {
+            sql_parse::Expression::Integer(v) => v.0,
+            other => {
+                return Err(ParseError {
+                    type_name: "BookGenre",
+                    field: "genre_id",
+                    detail: format!("{:?}", other),
+                })
+            }
+        };
+
+        Ok(BookGenre { book_id, genre_id })
     }
 }
 
 #[async_trait]
 impl Update for BookGenre {
-    async fn before_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
     }
 
@@ -905,11 +1237,16 @@ impl Update for BookGenre {
         &self,
         client: &Client,
         source_id: i16,
-    ) -> Result<(), Box<tokio_postgres::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send>> {
+        let book_id = i32::try_from(self.book_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+        let genre_id = i32::try_from(self.genre_id)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+
         match client
             .execute(
                 "SELECT update_book_sequence($1, $2, $3);",
-                &[&source_id, &(self.book_id as i32), &(self.genre_id as i32)],
+                &[&source_id, &book_id, &genre_id],
             )
             .await
         {
@@ -918,7 +1255,30 @@ impl Update for BookGenre {
         }
     }
 
-    async fn after_update(_client: &Client) -> Result<(), Box<tokio_postgres::Error>> {
+    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_book_date_falls_back_on_zero_date() {
+        let d = parse_book_date("0000-00-00 00:00:00");
+        assert_eq!(d, NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+    }
+
+    #[test]
+    fn parse_book_date_falls_back_on_date_only() {
+        let d = parse_book_date("2020-01-01");
+        assert_eq!(d, NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+    }
+
+    #[test]
+    fn parse_book_date_parses_valid_datetime() {
+        let d = parse_book_date("2020-01-01 12:00:00");
+        assert_eq!(d, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
     }
 }

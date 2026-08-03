@@ -1,11 +1,10 @@
-use std::{fmt::Debug, str::FromStr, sync::Arc};
+use std::fmt::Debug;
 
 use crate::config::{self, Webhook};
 use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::{io::copy, TryStreamExt};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use tokio::fs::{remove_file, File};
-use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_postgres::NoTls;
 use tracing::log;
@@ -77,32 +76,20 @@ async fn process<T>(
     pool: Pool,
     source_id: i16,
     file_name: &str,
-    deps: Vec<Arc<Mutex<Option<UpdateStatus>>>>,
+    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
     T: Debug + FromVecExpression<T> + Update,
 {
-    if !deps.is_empty() {
-        loop {
-            let mut some_failed = false;
-            let mut some_none = false;
-
-            for dep in deps.iter() {
-                let status = dep.lock().await;
-                match &*status {
-                    Some(status) => match status {
-                        UpdateStatus::Success => (),
-                        UpdateStatus::Fail => some_failed = true,
-                    },
-                    None => some_none = true,
-                }
-            }
-
-            if !some_failed && !some_none {
-                break;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    for mut dep in deps {
+        let failed = match dep.wait_for(|s| s.is_some()).await {
+            Ok(guard) => matches!(*guard, Some(UpdateStatus::Fail)),
+            Err(_) => true, // sender dropped without setting a status (e.g. producer panicked) => treat as failure
+        };
+        if failed {
+            return Err(Box::new(std::io::Error::other(format!(
+                "dependency failed, aborting {file_name}"
+            ))));
         }
     }
 
@@ -123,12 +110,19 @@ where
         Err(err) => return Err(Box::new(err)),
     };
 
-    match T::before_update(&pool.get().await.unwrap()).await {
+    let before_update_client = match pool.get().await {
+        Ok(c) => c,
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    match T::before_update(&before_update_client).await {
         Ok(_) => (),
         Err(err) => return Err(err),
     };
 
     log::info!("Start update {file_name}...");
+
+    let mut parse_error_count: u32 = 0;
 
     for line in lines.into_iter() {
         let line = match line {
@@ -148,8 +142,19 @@ where
         {
             for value in i.values.into_iter() {
                 for t_value in value.1.into_iter() {
-                    let value = T::from_vec_expression(&t_value);
-                    let client = pool.get().await.unwrap();
+                    let value = match T::from_vec_expression(&t_value) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            log::error!("Parse error in {file_name}: {:?}", e);
+                            parse_error_count += 1;
+                            continue;
+                        }
+                    };
+
+                    let client = match pool.get().await {
+                        Ok(c) => c,
+                        Err(err) => return Err(Box::new(err)),
+                    };
 
                     match value.update(&client, source_id).await {
                         Ok(_) => {
@@ -165,14 +170,46 @@ where
         }
     }
 
-    match T::after_update(&pool.get().await.unwrap()).await {
+    let after_update_client = match pool.get().await {
+        Ok(c) => c,
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    match T::after_update(&after_update_client).await {
         Ok(_) => (),
         Err(err) => return Err(err),
     };
 
+    if parse_error_count > 0 {
+        log::error!("{file_name}: {parse_error_count} row(s) failed to parse");
+        return Err(Box::new(std::io::Error::other(format!(
+            "{file_name}: {parse_error_count} row(s) failed to parse"
+        ))));
+    }
+
     log::info!("Updated {file_name}...");
 
     Ok(())
+}
+
+async fn run_task<T>(
+    pool: Pool,
+    source_id: i16,
+    file_name: &'static str,
+    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
+    status_tx: tokio::sync::watch::Sender<Option<UpdateStatus>>,
+) -> (&'static str, Result<(), Box<dyn std::error::Error + Send>>)
+where
+    T: Debug + FromVecExpression<T> + Update,
+{
+    let result = process::<T>(pool, source_id, file_name, deps).await;
+    let status = if result.is_ok() {
+        UpdateStatus::Success
+    } else {
+        UpdateStatus::Fail
+    };
+    let _ = status_tx.send(Some(status));
+    (file_name, result)
 }
 
 async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
@@ -195,7 +232,10 @@ async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
 }
 
 async fn get_source(pool: Pool) -> Result<i16, Box<dyn std::error::Error>> {
-    let client = pool.get().await.unwrap();
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(err) => return Err(Box::new(err)),
+    };
 
     let row = match client
         .query_one("SELECT id FROM sources WHERE name = 'flibusta';", &[])
@@ -210,6 +250,7 @@ async fn get_source(pool: Pool) -> Result<i16, Box<dyn std::error::Error>> {
     Ok(id)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum UpdateStatus {
     Success,
     Fail,
@@ -230,22 +271,7 @@ async fn send_webhooks() -> Result<(), Box<reqwest::Error>> {
             config::Method::Post => client.post(url),
         };
 
-        let t_headers: Vec<(HeaderName, HeaderValue)> = headers
-            .into_iter()
-            .map(|(key, val)| {
-                let value = match val {
-                    serde_json::Value::String(v) => v,
-                    _ => panic!("Header value not string!"),
-                };
-
-                (
-                    HeaderName::from_str(key.as_ref()).unwrap(),
-                    HeaderValue::from_str(&value).unwrap(),
-                )
-            })
-            .collect();
-
-        let headers = HeaderMap::from_iter(t_headers.into_iter());
+        let headers = HeaderMap::from_iter(headers);
 
         let response = builder.headers(headers).send().await;
 
@@ -277,197 +303,124 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = match get_postgres_pool().await {
         Ok(pool) => pool,
-        Err(err) => panic!("{:?}", err),
+        Err(err) => return Err(Box::new(err)),
     };
 
     let source_id = match get_source(pool.clone()).await {
-        Ok(v) => Arc::new(v),
-        Err(err) => panic!("{:?}", err),
+        Ok(v) => v,
+        Err(err) => return Err(err),
     };
 
-    let author_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
-    let book_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
-    let sequence_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
-    let book_annotation_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
-    let author_annotation_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
-    let genre_status: Arc<Mutex<Option<UpdateStatus>>> = Arc::new(Mutex::new(None));
+    let (author_tx, author_rx) = tokio::sync::watch::channel(None);
+    let (book_tx, book_rx) = tokio::sync::watch::channel(None);
+    let (book_author_tx, _book_author_rx) = tokio::sync::watch::channel(None);
+    let (translator_tx, _translator_rx) = tokio::sync::watch::channel(None);
+    let (sequence_tx, sequence_rx) = tokio::sync::watch::channel(None);
+    let (sequence_info_tx, _sequence_info_rx) = tokio::sync::watch::channel(None);
+    let (book_annotation_tx, book_annotation_rx) = tokio::sync::watch::channel(None);
+    let (book_annotation_pics_tx, _book_annotation_pics_rx) = tokio::sync::watch::channel(None);
+    let (author_annotation_tx, author_annotation_rx) = tokio::sync::watch::channel(None);
+    let (author_annotation_pics_tx, _author_annotation_pics_rx) = tokio::sync::watch::channel(None);
+    let (genre_tx, genre_rx) = tokio::sync::watch::channel(None);
+    let (book_genre_tx, _book_genre_rx) = tokio::sync::watch::channel(None);
 
-    let pool_clone = pool.clone();
-    let author_status_clone = author_status.clone();
-    let source_id_clone = source_id.clone();
-    let author_process = tokio::spawn(async move {
-        match process::<Author>(pool_clone, *source_id_clone, "lib.libavtorname.sql", vec![]).await
-        {
-            Ok(_) => {
-                let mut status = author_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = author_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Err(err)
-            }
-        }
-    });
+    let author_process = tokio::spawn(run_task::<Author>(
+        pool.clone(),
+        source_id,
+        "lib.libavtorname.sql",
+        vec![],
+        author_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let book_status_clone = book_status.clone();
-    let source_id_clone = source_id.clone();
-    let book_process = tokio::spawn(async move {
-        match process::<Book>(pool_clone, *source_id_clone, "lib.libbook.sql", vec![]).await {
-            Ok(_) => {
-                let mut status = book_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = book_status_clone.lock().await;
-                *status = Some(UpdateStatus::Fail);
-                Err(err)
-            }
-        }
-    });
+    let book_process = tokio::spawn(run_task::<Book>(
+        pool.clone(),
+        source_id,
+        "lib.libbook.sql",
+        vec![],
+        book_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![author_status.clone(), book_status.clone()];
-    let source_id_clone = source_id.clone();
-    let book_author_process = tokio::spawn(async move {
-        process::<BookAuthor>(pool_clone, *source_id_clone, "lib.libavtor.sql", deps).await
-    });
+    let book_author_process = tokio::spawn(run_task::<BookAuthor>(
+        pool.clone(),
+        source_id,
+        "lib.libavtor.sql",
+        vec![author_rx.clone(), book_rx.clone()],
+        book_author_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![author_status.clone(), book_status.clone()];
-    let source_id_clone = source_id.clone();
-    let translator_process = tokio::spawn(async move {
-        process::<Translator>(pool_clone, *source_id_clone, "lib.libtranslator.sql", deps).await
-    });
+    let translator_process = tokio::spawn(run_task::<Translator>(
+        pool.clone(),
+        source_id,
+        "lib.libtranslator.sql",
+        vec![author_rx.clone(), book_rx.clone()],
+        translator_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let sequence_status_clone = sequence_status.clone();
-    let source_id_clone = source_id.clone();
-    let sequence_process = tokio::spawn(async move {
-        match process::<Sequence>(pool_clone, *source_id_clone, "lib.libseqname.sql", vec![]).await
-        {
-            Ok(_) => {
-                let mut status = sequence_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = sequence_status_clone.lock().await;
-                *status = Some(UpdateStatus::Fail);
-                Err(err)
-            }
-        }
-    });
+    let sequence_process = tokio::spawn(run_task::<Sequence>(
+        pool.clone(),
+        source_id,
+        "lib.libseqname.sql",
+        vec![],
+        sequence_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![book_status.clone(), sequence_status.clone()];
-    let source_id_clone = source_id.clone();
-    let sequence_info_process = tokio::spawn(async move {
-        process::<SequenceInfo>(pool_clone, *source_id_clone, "lib.libseq.sql", deps).await
-    });
+    let sequence_info_process = tokio::spawn(run_task::<SequenceInfo>(
+        pool.clone(),
+        source_id,
+        "lib.libseq.sql",
+        vec![book_rx.clone(), sequence_rx.clone()],
+        sequence_info_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![book_status.clone()];
-    let book_annotation_status_clone = book_annotation_status.clone();
-    let source_id_clone = source_id.clone();
-    let book_annotation_process = tokio::spawn(async move {
-        match process::<BookAnnotation>(pool_clone, *source_id_clone, "lib.b.annotations.sql", deps)
-            .await
-        {
-            Ok(_) => {
-                let mut status = book_annotation_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = book_annotation_status_clone.lock().await;
-                *status = Some(UpdateStatus::Fail);
-                Err(err)
-            }
-        }
-    });
+    let book_annotation_process = tokio::spawn(run_task::<BookAnnotation>(
+        pool.clone(),
+        source_id,
+        "lib.b.annotations.sql",
+        vec![book_rx.clone()],
+        book_annotation_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![book_annotation_status.clone()];
-    let source_id_clone = source_id.clone();
-    let book_annotation_pics_process = tokio::spawn(async move {
-        process::<BookAnnotationPic>(
-            pool_clone,
-            *source_id_clone,
-            "lib.b.annotations_pics.sql",
-            deps,
-        )
-        .await
-    });
+    let book_annotation_pics_process = tokio::spawn(run_task::<BookAnnotationPic>(
+        pool.clone(),
+        source_id,
+        "lib.b.annotations_pics.sql",
+        vec![book_annotation_rx.clone()],
+        book_annotation_pics_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![author_status.clone()];
-    let author_annotation_status_clone = author_annotation_status.clone();
-    let source_id_clone = source_id.clone();
-    let author_annotation_process = tokio::spawn(async move {
-        match process::<AuthorAnnotation>(
-            pool_clone,
-            *source_id_clone,
-            "lib.a.annotations.sql",
-            deps,
-        )
-        .await
-        {
-            Ok(_) => {
-                let mut status = author_annotation_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = author_annotation_status_clone.lock().await;
-                *status = Some(UpdateStatus::Fail);
-                Err(err)
-            }
-        }
-    });
+    let author_annotation_process = tokio::spawn(run_task::<AuthorAnnotation>(
+        pool.clone(),
+        source_id,
+        "lib.a.annotations.sql",
+        vec![author_rx.clone()],
+        author_annotation_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![author_annotation_status.clone()];
-    let source_id_clone = source_id.clone();
-    let author_annotation_pics_process = tokio::spawn(async move {
-        process::<AuthorAnnotationPic>(
-            pool_clone,
-            *source_id_clone,
-            "lib.a.annotations_pics.sql",
-            deps,
-        )
-        .await
-    });
+    let author_annotation_pics_process = tokio::spawn(run_task::<AuthorAnnotationPic>(
+        pool.clone(),
+        source_id,
+        "lib.a.annotations_pics.sql",
+        vec![author_annotation_rx.clone()],
+        author_annotation_pics_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let genre_status_clone = genre_status.clone();
-    let source_id_clone = source_id.clone();
-    let genre_annotation_process = tokio::spawn(async move {
-        match process::<Genre>(pool_clone, *source_id_clone, "lib.libgenrelist.sql", vec![]).await {
-            Ok(_) => {
-                let mut status = genre_status_clone.lock().await;
-                *status = Some(UpdateStatus::Success);
-                Ok(())
-            }
-            Err(err) => {
-                let mut status = genre_status_clone.lock().await;
-                *status = Some(UpdateStatus::Fail);
-                Err(err)
-            }
-        }
-    });
+    let genre_process = tokio::spawn(run_task::<Genre>(
+        pool.clone(),
+        source_id,
+        "lib.libgenrelist.sql",
+        vec![],
+        genre_tx,
+    ));
 
-    let pool_clone = pool.clone();
-    let deps = vec![genre_status.clone(), book_status.clone()];
-    let source_id_clone = source_id.clone();
-    let book_genre_process = tokio::spawn(async move {
-        process::<BookGenre>(pool_clone, *source_id_clone, "lib.libgenre.sql", deps).await
-    });
+    let book_genre_process = tokio::spawn(run_task::<BookGenre>(
+        pool.clone(),
+        source_id,
+        "lib.libgenre.sql",
+        vec![genre_rx.clone(), book_rx.clone()],
+        book_genre_tx,
+    ));
 
-    for process in [
+    let handles = [
         author_process,
         book_process,
         book_author_process,
@@ -478,18 +431,32 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         book_annotation_pics_process,
         author_annotation_process,
         author_annotation_pics_process,
-        genre_annotation_process,
+        genre_process,
         book_genre_process,
-    ] {
-        let process_result = match process.await {
-            Ok(v) => v,
-            Err(err) => return Err(Box::new(err)),
-        };
+    ];
 
-        match process_result {
-            Ok(_) => (),
-            Err(err) => panic!("{:?}", err),
+    let mut failures: Vec<String> = Vec::new();
+
+    for handle in handles {
+        match handle.await {
+            Ok((file_name, Ok(()))) => {
+                let _ = file_name;
+            }
+            Ok((file_name, Err(err))) => {
+                failures.push(format!("{file_name}: {err}"));
+            }
+            Err(join_err) => {
+                failures.push(format!("join error: {join_err}"));
+            }
         }
+    }
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            log::error!("{failure}");
+        }
+
+        return Err(Box::new(std::io::Error::other(failures.join("; "))));
     }
 
     match send_webhooks().await {
@@ -505,8 +472,11 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn cron_jobs() {
-    let job_scheduler = JobScheduler::new().await.unwrap();
+pub async fn cron_jobs() -> Result<(), Box<dyn std::error::Error>> {
+    let job_scheduler = match JobScheduler::new().await {
+        Ok(v) => v,
+        Err(err) => return Err(Box::new(err)),
+    };
 
     let update_job = match Job::new_async("0 0 3 * * *", |_uuid, _l| {
         Box::pin(async {
@@ -517,14 +487,19 @@ pub async fn cron_jobs() {
         })
     }) {
         Ok(v) => v,
-        Err(err) => panic!("{:?}", err),
+        Err(err) => return Err(Box::new(err)),
     };
 
-    job_scheduler.add(update_job).await.unwrap();
+    match job_scheduler.add(update_job).await {
+        Ok(_) => (),
+        Err(err) => return Err(Box::new(err)),
+    };
 
     log::info!("Scheduler start...");
     match job_scheduler.start().await {
         Ok(v) => v,
-        Err(err) => panic!("{:?}", err),
+        Err(err) => return Err(Box::new(err)),
     };
+
+    Ok(())
 }

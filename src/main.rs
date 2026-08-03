@@ -69,7 +69,10 @@ async fn main() {
     dotenv().ok();
 
     let options = ClientOptions {
-        dsn: Some(Dsn::from_str(&config::CONFIG.sentry_dsn).unwrap()),
+        dsn: Some(
+            Dsn::from_str(&config::CONFIG.sentry_dsn)
+                .unwrap_or_else(|e| panic!("Invalid SENTRY_DSN env variable: {e}")),
+        ),
         default_integrations: false,
         ..Default::default()
     }
@@ -88,5 +91,12 @@ async fn main() {
         .with(sentry_layer)
         .init();
 
-    tokio::join![cron_jobs(), start_app()];
+    let cron_task = async {
+        match cron_jobs().await {
+            Ok(_) => {}
+            Err(err) => log::error!("cron_jobs failed to start: {:?}", err),
+        }
+    };
+
+    tokio::join![cron_task, start_app()];
 }
