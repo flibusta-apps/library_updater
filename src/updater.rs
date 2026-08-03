@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use crate::config::{self, Webhook};
 use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -93,6 +94,8 @@ where
         }
     }
 
+    let start_time = std::time::Instant::now();
+
     match download_file(file_name).await {
         Ok(_) => (),
         Err(err) => return Err(err),
@@ -123,6 +126,8 @@ where
     log::info!("Start update {file_name}...");
 
     let mut parse_error_count: u32 = 0;
+
+    let mut upserted_count: u32 = 0;
 
     for line in lines.into_iter() {
         let line = match line {
@@ -159,6 +164,7 @@ where
                     match value.update(&client, source_id).await {
                         Ok(_) => {
                             // log::info!("{:?}", value);
+                            upserted_count += 1;
                         }
                         Err(err) => {
                             log::error!("Update error: {:?} : {:?}", value, err);
@@ -179,6 +185,20 @@ where
         Ok(_) => (),
         Err(err) => return Err(err),
     };
+
+    log::info!(
+        "{file_name} summary: parsed={} upserted={} skipped={} duration={:.2}s",
+        upserted_count + parse_error_count,
+        upserted_count,
+        parse_error_count,
+        start_time.elapsed().as_secs_f64()
+    );
+    RUN_STATE
+        .rows_processed_total
+        .fetch_add(upserted_count as u64, Ordering::Relaxed);
+    RUN_STATE
+        .rows_skipped_total
+        .fetch_add(parse_error_count as u64, Ordering::Relaxed);
 
     if parse_error_count > 0 {
         log::error!("{file_name}: {parse_error_count} row(s) failed to parse");
@@ -206,6 +226,7 @@ where
     let status = if result.is_ok() {
         UpdateStatus::Success
     } else {
+        RUN_STATE.errors_total.fetch_add(1, Ordering::Relaxed);
         UpdateStatus::Fail
     };
     let _ = status_tx.send(Some(status));
@@ -293,12 +314,92 @@ lazy_static! {
     pub static ref UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
 }
 
+pub struct RunState {
+    pub running: AtomicBool,
+    pub last_start: AtomicI64,
+    pub last_finish: AtomicI64,
+    pub last_success_at: AtomicI64,
+    pub last_result: std::sync::RwLock<Option<String>>,
+    pub rows_processed_total: AtomicU64,
+    pub rows_skipped_total: AtomicU64,
+    pub errors_total: AtomicU64,
+}
+
+pub struct StatusSnapshot {
+    pub running: bool,
+    pub last_start: i64,
+    pub last_finish: i64,
+    pub last_success_at: i64,
+    pub last_result: Option<String>,
+    pub rows_processed_total: u64,
+    pub rows_skipped_total: u64,
+    pub errors_total: u64,
+}
+
+impl RunState {
+    fn new() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            last_start: AtomicI64::new(0),
+            last_finish: AtomicI64::new(0),
+            last_success_at: AtomicI64::new(0),
+            last_result: std::sync::RwLock::new(None),
+            rows_processed_total: AtomicU64::new(0),
+            rows_skipped_total: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+        }
+    }
+
+    fn begin_run(&self) {
+        self.running.store(true, Ordering::SeqCst);
+        self.last_start
+            .store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
+    }
+
+    fn end_run(&self, success: bool, message: String) {
+        self.running.store(false, Ordering::SeqCst);
+        let now = chrono::Utc::now().timestamp();
+        self.last_finish.store(now, Ordering::SeqCst);
+        if success {
+            self.last_success_at.store(now, Ordering::SeqCst);
+        }
+        *self.last_result.write().unwrap() = Some(message);
+    }
+
+    pub fn snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            running: self.running.load(Ordering::SeqCst),
+            last_start: self.last_start.load(Ordering::SeqCst),
+            last_finish: self.last_finish.load(Ordering::SeqCst),
+            last_success_at: self.last_success_at.load(Ordering::SeqCst),
+            last_result: self.last_result.read().unwrap().clone(),
+            rows_processed_total: self.rows_processed_total.load(Ordering::SeqCst),
+            rows_skipped_total: self.rows_skipped_total.load(Ordering::SeqCst),
+            errors_total: self.errors_total.load(Ordering::SeqCst),
+        }
+    }
+}
+
+lazy_static! {
+    pub static ref RUN_STATE: RunState = RunState::new();
+}
+
 pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = match UPDATE_LOCK.try_lock() {
         Ok(v) => v,
         Err(err) => return Err(Box::new(err)),
     };
 
+    RUN_STATE.begin_run();
+    let result = run_update_inner().await;
+    match &result {
+        Ok(_) => RUN_STATE.end_run(true, "success".to_string()),
+        Err(err) => RUN_STATE.end_run(false, err.to_string()),
+    }
+    result
+}
+
+async fn run_update_inner() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Start update...");
 
     let pool = match get_postgres_pool().await {
@@ -464,7 +565,7 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
             log::info!("Webhooks sended!");
         }
         Err(err) => {
-            log::info!("Webhooks send failed : {err}");
+            log::error!("Webhooks send failed : {err}");
             return Err(Box::new(err));
         }
     };
@@ -482,7 +583,10 @@ pub async fn cron_jobs() -> Result<(), Box<dyn std::error::Error>> {
         Box::pin(async {
             match update().await {
                 Ok(_) => log::info!("Updated"),
-                Err(err) => log::info!("Update err: {:?}", err),
+                Err(err) => {
+                    log::error!("Update err: {:?}", err);
+                    sentry::capture_error(err.as_ref());
+                }
             };
         })
     }) {

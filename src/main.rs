@@ -18,6 +18,46 @@ async fn health() -> &'static str {
     "OK"
 }
 
+async fn status() -> axum::Json<serde_json::Value> {
+    let snap = updater::RUN_STATE.snapshot();
+    axum::Json(serde_json::json!({
+        "running": snap.running,
+        "last_start": snap.last_start,
+        "last_finish": snap.last_finish,
+        "last_success_at": snap.last_success_at,
+        "last_result": snap.last_result,
+        "rows_processed_total": snap.rows_processed_total,
+        "rows_skipped_total": snap.rows_skipped_total,
+        "errors_total": snap.errors_total,
+    }))
+}
+
+async fn metrics() -> String {
+    let snap = updater::RUN_STATE.snapshot();
+    format!(
+        "# HELP update_running 1 if an update is currently running\n\
+# TYPE update_running gauge\n\
+update_running {}\n\
+# HELP update_last_success_timestamp Unix timestamp of last successful update\n\
+# TYPE update_last_success_timestamp gauge\n\
+update_last_success_timestamp {}\n\
+# HELP update_rows_processed_total Total rows upserted across all update runs\n\
+# TYPE update_rows_processed_total counter\n\
+update_rows_processed_total {}\n\
+# HELP update_rows_skipped_total Total rows skipped (parse errors) across all update runs\n\
+# TYPE update_rows_skipped_total counter\n\
+update_rows_skipped_total {}\n\
+# HELP update_errors_total Total failed update runs\n\
+# TYPE update_errors_total counter\n\
+update_errors_total {}\n",
+        if snap.running { 1 } else { 0 },
+        snap.last_success_at,
+        snap.rows_processed_total,
+        snap.rows_skipped_total,
+        snap.errors_total,
+    )
+}
+
 async fn update(headers: HeaderMap) -> &'static str {
     let config_api_key = config::CONFIG.api_key.clone();
 
@@ -33,7 +73,10 @@ async fn update(headers: HeaderMap) -> &'static str {
     tokio::spawn(async {
         match updater::update().await {
             Ok(_) => log::info!("Updated!"),
-            Err(err) => log::info!("Updater err: {:?}", err),
+            Err(err) => {
+                log::error!("Updater err: {:?}", err);
+                sentry::capture_error(err.as_ref());
+            }
         };
     });
 
@@ -43,6 +86,8 @@ async fn update(headers: HeaderMap) -> &'static str {
 async fn start_app() {
     let app = Router::new()
         .route("/health", axum::routing::get(health))
+        .route("/status", axum::routing::get(status))
+        .route("/metrics", axum::routing::get(metrics))
         .route("/update", post(update))
         .layer(
             TraceLayer::new_for_http()
@@ -67,7 +112,7 @@ async fn main() {
             Dsn::from_str(&config::CONFIG.sentry_dsn)
                 .unwrap_or_else(|e| panic!("Invalid SENTRY_DSN env variable: {e}")),
         ),
-        default_integrations: false,
+        default_integrations: true,
         ..Default::default()
     }
     .add_integration(DebugImagesIntegration::new());
