@@ -79,6 +79,45 @@ pub struct Config {
     pub download_connect_timeout_secs: u64,
     pub download_idle_timeout_secs: u64,
     pub download_max_attempts: u32,
+
+    /// Languages considered "kept" (non-deleted) for books; anything else is
+    /// soft-deleted at merge time. Comma-separated, lowercased, trimmed.
+    /// Deliberately panics if the resulting list is empty: an empty list
+    /// would flip `is_deleted = true` for the entire catalog.
+    pub allowed_langs: Vec<String>,
+    /// Max size of the deadpool-postgres connection pool. deadpool's default
+    /// (`cpu_count * 4`) can silently serialize the 12 concurrent
+    /// `stage_file` tasks (each holding a connection for the whole file)
+    /// onto far fewer real connections than intended.
+    pub postgres_max_pool_size: usize,
+    /// Minimum ratio of (rows staged this run) / (non-deleted rows currently
+    /// in the DB for this source) required to proceed to the merge
+    /// transaction. Guards against a truncated/partial upstream dump
+    /// silently soft-deleting the whole catalog via the anti-join delete
+    /// steps. Skipped when the DB-side count is 0 (first run for a source).
+    pub min_staging_ratio: f64,
+    /// `work_mem` used for the Phase B merge transaction (`SET LOCAL
+    /// work_mem = ...`). The merge plan does several hash joins/aggregates
+    /// over the staging tables, so a larger-than-default work_mem avoids
+    /// disk spills. Overridable per-deployment via `MERGE_WORK_MEM`.
+    pub merge_work_mem: String,
+}
+
+fn parse_allowed_langs(raw: &str) -> Vec<String> {
+    let langs: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if langs.is_empty() {
+        panic!(
+            "ALLOWED_LANGS resolved to an empty list ({:?}); an empty allow-list would soft-delete the entire catalog",
+            raw
+        );
+    }
+
+    langs
 }
 
 fn get_env(env: &'static str) -> String {
@@ -119,6 +158,14 @@ impl Config {
             download_connect_timeout_secs: get_env_or("DOWNLOAD_CONNECT_TIMEOUT_SECS", 10),
             download_idle_timeout_secs: get_env_or("DOWNLOAD_IDLE_TIMEOUT_SECS", 60),
             download_max_attempts: get_env_or("DOWNLOAD_MAX_ATTEMPTS", 3),
+
+            allowed_langs: parse_allowed_langs(&get_env_or(
+                "ALLOWED_LANGS",
+                "ru,be,uk".to_string(),
+            )),
+            postgres_max_pool_size: get_env_or("POSTGRES_MAX_POOL_SIZE", 16),
+            min_staging_ratio: get_env_or("MIN_STAGING_RATIO", 0.5),
+            merge_work_mem: get_env_or("MERGE_WORK_MEM", "256MB".to_string()),
         }
     }
 }

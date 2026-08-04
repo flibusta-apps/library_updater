@@ -17,13 +17,15 @@ use async_compression::futures::bufread::GzipDecoder;
 
 use crate::types::{
     Author, AuthorAnnotation, AuthorAnnotationPic, BookAnnotation, BookAnnotationPic, BookAuthor,
-    BookGenre, FromVecExpression, Genre, Sequence, SequenceInfo, Translator, Update,
+    BookGenre, FromVecExpression, Genre, Sequence, SequenceInfo, Staged, Translator,
 };
 use crate::utils::read_lines;
 use sql_parse::{
-    parse_statement, InsertReplace, InsertReplaceType, Issues, ParseOptions, SQLArguments,
-    SQLDialect, Statement,
+    parse_statement, Expression, InsertReplace, InsertReplaceType, Issues, ParseOptions,
+    SQLArguments, SQLDialect, Statement,
 };
+use tokio_postgres::types::ToSql;
+use tokio_postgres::Client;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::types::Book;
@@ -70,7 +72,7 @@ async fn download_attempt(
     url: &str,
     part_path: &Path,
     idle: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let response = match client.get(url).send().await {
         Ok(v) => v,
         Err(err) => return Err(Box::new(err)),
@@ -134,13 +136,13 @@ async fn download_file_with_client(
     file_name: &str,
     idle: Duration,
     max_attempts: u32,
-) -> Result<(), Box<dyn std::error::Error + Send>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!("Download {file_name}...");
 
     let final_path = dest_dir.join(file_name);
     let part_path = dest_dir.join(format!("{file_name}.part"));
 
-    let mut last_err: Option<Box<dyn std::error::Error + Send>> = None;
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
     for attempt in 0..max_attempts {
         let attempt_result = download_attempt(client, url, &part_path, idle).await;
@@ -192,7 +194,7 @@ async fn download_file_with_client(
 async fn download_file(
     dest_dir: &Path,
     file_name: &str,
-) -> Result<(), Box<dyn std::error::Error + Send>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let link = format!("{}/sql/{file_name}.gz", &config::CONFIG.fl_base_url);
 
     download_file_with_client(
@@ -206,19 +208,39 @@ async fn download_file(
     .await
 }
 
-async fn process<T>(
+/// Number of rows successfully staged / skipped (failed to parse or failed
+/// range conversion) for a single dump file.
+#[derive(Debug, Default, Clone, Copy)]
+struct StageStats {
+    staged: u64,
+    skipped: u64,
+}
+
+/// One Phase A `stage_file` task's outcome, tagged with its dump file name
+/// for error reporting/logging (see `stage_task`/`aggregate_stage_outcomes`).
+type StageOutcome = (
+    &'static str,
+    Result<StageStats, Box<dyn std::error::Error + Send + Sync>>,
+);
+
+/// Phase A: download one dump file and bulk-load it into its staging table
+/// via `COPY ... FROM STDIN BINARY`. Uses exactly one pooled connection for
+/// the whole file (unlike the old row-by-row `process::<T>`, which grabbed a
+/// connection per row). Has no dependency on any other `stage_file` call -
+/// all 12 entity types can load fully concurrently because resolution of
+/// remote ids to local ids now happens JOIN-side in the Phase B merge
+/// transaction rather than by choreographed ordering here.
+async fn stage_file<T>(
     pool: Pool,
-    source_id: i16,
-    file_name: &str,
-    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
-) -> Result<(), Box<dyn std::error::Error + Send>>
+    file_name: &'static str,
+) -> Result<StageStats, Box<dyn std::error::Error + Send + Sync>>
 where
-    T: Debug + FromVecExpression<T> + Update,
+    T: Debug + FromVecExpression<T> + Staged,
 {
     let data_dir = PathBuf::from(&config::CONFIG.data_dir);
     let final_path = data_dir.join(file_name);
 
-    let result = process_inner::<T>(pool, source_id, file_name, &data_dir, &final_path, deps).await;
+    let result = stage_file_inner::<T>(pool, file_name, &data_dir, &final_path).await;
 
     // Always clean up the decompressed dump after processing, regardless of
     // whether processing succeeded or failed.
@@ -230,175 +252,125 @@ where
     result
 }
 
-async fn process_inner<T>(
-    pool: Pool,
-    source_id: i16,
-    file_name: &str,
-    data_dir: &Path,
-    final_path: &Path,
-    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
-) -> Result<(), Box<dyn std::error::Error + Send>>
-where
-    T: Debug + FromVecExpression<T> + Update,
-{
-    for mut dep in deps {
-        let failed = match dep.wait_for(|s| s.is_some()).await {
-            Ok(guard) => matches!(*guard, Some(UpdateStatus::Fail)),
-            Err(_) => true, // sender dropped without setting a status (e.g. producer panicked) => treat as failure
-        };
-        if failed {
-            return Err(Box::new(std::io::Error::other(format!(
-                "dependency failed, aborting {file_name}"
-            ))));
-        }
-    }
-
-    let start_time = std::time::Instant::now();
-
-    match download_file(data_dir, file_name).await {
-        Ok(_) => (),
-        Err(err) => return Err(err),
-    };
-
+/// Parse a single line from a Flibusta MySQL dump into the list of
+/// value-rows found in its `INSERT` statement. Returns an empty `Vec` for
+/// any line that isn't a recognized `INSERT` (blank lines, `LOCK TABLES`
+/// statements, comments, a genuine parse failure, etc.) - not an error,
+/// since dump files routinely contain such non-`INSERT` lines interleaved
+/// with the data rows.
+///
+/// Pure and I/O-free (no DB, no filesystem): this is the "parse line ->
+/// entities" step, kept deliberately separate from the `COPY`/IO loop in
+/// `stage_file_inner` so it can be unit-tested directly, including from
+/// `crate::types`'s `FromVecExpression` fixture tests.
+pub fn parse_insert_values(line: &str) -> Vec<Vec<Expression<'_>>> {
     let parse_options = ParseOptions::new()
         .dialect(SQLDialect::MariaDB)
         .arguments(SQLArguments::QuestionMark)
         .warn_unquoted_identifiers(true);
 
-    let lines = read_lines(final_path);
+    let mut issues = Issues::new(line);
+    let ast = parse_statement(line, &mut issues, &parse_options);
 
-    let lines = match lines {
-        Ok(v) => v,
-        Err(err) => return Err(Box::new(err)),
-    };
-
-    let before_update_client = match pool.get().await {
-        Ok(c) => c,
-        Err(err) => return Err(Box::new(err)),
-    };
-
-    match T::before_update(&before_update_client).await {
-        Ok(_) => (),
-        Err(err) => return Err(err),
-    };
-
-    log::info!("Start update {file_name}...");
-
-    let mut parse_error_count: u32 = 0;
-
-    let mut upserted_count: u32 = 0;
-
-    let mut line_no: u64 = 0;
-
-    for line in lines.into_iter() {
-        line_no += 1;
-
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => {
-                return Err(Box::new(std::io::Error::new(
-                    err.kind(),
-                    format!("{file_name}: invalid data at/after line {line_no}: {err}"),
-                )));
-            }
-        };
-
-        let mut issues = Issues::new(&line);
-        let ast = parse_statement(&line, &mut issues, &parse_options);
-
-        if let Some(Statement::InsertReplace(
+    match ast {
+        Some(Statement::InsertReplace(
             i @ InsertReplace {
                 type_: InsertReplaceType::Insert(_),
                 ..
             },
-        )) = ast
-        {
-            for value in i.values.into_iter() {
-                for t_value in value.1.into_iter() {
-                    let value = match T::from_vec_expression(&t_value) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            log::error!("Parse error in {file_name}: {:?}", e);
-                            parse_error_count += 1;
-                            continue;
-                        }
-                    };
+        )) => i.values.into_iter().flat_map(|v| v.1).collect(),
+        _ => Vec::new(),
+    }
+}
 
-                    let client = match pool.get().await {
-                        Ok(c) => c,
-                        Err(err) => return Err(Box::new(err)),
-                    };
+async fn stage_file_inner<T>(
+    pool: Pool,
+    file_name: &str,
+    data_dir: &Path,
+    final_path: &Path,
+) -> Result<StageStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: Debug + FromVecExpression<T> + Staged,
+{
+    let start_time = std::time::Instant::now();
 
-                    match value.update(&client, source_id).await {
-                        Ok(_) => {
-                            // log::info!("{:?}", value);
-                            upserted_count += 1;
-                        }
-                        Err(err) => {
-                            log::error!("Update error: {:?} : {:?}", value, err);
-                            return Err(err);
-                        }
-                    }
+    download_file(data_dir, file_name).await?;
+
+    let lines = read_lines(final_path)?;
+
+    let client = pool.get().await?;
+
+    let copy_sql = format!(
+        "COPY {} ({}) FROM STDIN BINARY",
+        T::STAGING_TABLE,
+        T::COLUMNS.join(", ")
+    );
+
+    let sink = client.copy_in(&copy_sql).await?;
+    let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(sink, &T::column_types());
+    futures::pin_mut!(writer);
+
+    log::info!("Start staging {file_name}...");
+
+    let mut skipped: u64 = 0;
+
+    for (line_no, line) in (1_u64..).zip(lines) {
+        let line = line.map_err(|err| {
+            Box::new(std::io::Error::new(
+                err.kind(),
+                format!("{file_name}: invalid data at/after line {line_no}: {err}"),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
+        for t_value in parse_insert_values(&line) {
+            let value = match T::from_vec_expression(&t_value) {
+                Ok(value) => value,
+                Err(e) => {
+                    log::error!("Parse error in {file_name}: {:?}", e);
+                    skipped += 1;
+                    continue;
                 }
-            }
+            };
+
+            let row = match value.to_row() {
+                Ok(row) => row,
+                Err(e) => {
+                    log::error!("Row conversion error in {file_name}: {:?}", e);
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let params: Vec<&(dyn ToSql + Sync)> =
+                row.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
+
+            writer.as_mut().write(&params).await?;
         }
     }
 
-    let after_update_client = match pool.get().await {
-        Ok(c) => c,
-        Err(err) => return Err(Box::new(err)),
-    };
-
-    match T::after_update(&after_update_client).await {
-        Ok(_) => (),
-        Err(err) => return Err(err),
-    };
+    let staged = writer.finish().await?;
 
     log::info!(
-        "{file_name} summary: parsed={} upserted={} skipped={} duration={:.2}s",
-        upserted_count + parse_error_count,
-        upserted_count,
-        parse_error_count,
+        "{file_name} summary: staged={staged} skipped={skipped} duration={:.2}s",
         start_time.elapsed().as_secs_f64()
     );
-    RUN_STATE
-        .rows_processed_total
-        .fetch_add(upserted_count as u64, Ordering::Relaxed);
-    RUN_STATE
-        .rows_skipped_total
-        .fetch_add(parse_error_count as u64, Ordering::Relaxed);
 
-    if parse_error_count > 0 {
-        log::error!("{file_name}: {parse_error_count} row(s) failed to parse");
-        return Err(Box::new(std::io::Error::other(format!(
-            "{file_name}: {parse_error_count} row(s) failed to parse"
-        ))));
-    }
-
-    log::info!("Updated {file_name}...");
-
-    Ok(())
+    Ok(StageStats { staged, skipped })
 }
 
-async fn run_task<T>(
+/// Wraps `stage_file` so the spawned task's result carries the file name for
+/// error reporting/logging.
+async fn stage_task<T>(
     pool: Pool,
-    source_id: i16,
     file_name: &'static str,
-    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
-    status_tx: tokio::sync::watch::Sender<Option<UpdateStatus>>,
-) -> (&'static str, Result<(), Box<dyn std::error::Error + Send>>)
+) -> (
+    &'static str,
+    Result<StageStats, Box<dyn std::error::Error + Send + Sync>>,
+)
 where
-    T: Debug + FromVecExpression<T> + Update,
+    T: Debug + FromVecExpression<T> + Staged,
 {
-    let result = process::<T>(pool, source_id, file_name, deps).await;
-    let status = if result.is_ok() {
-        UpdateStatus::Success
-    } else {
-        RUN_STATE.errors_total.fetch_add(1, Ordering::Relaxed);
-        UpdateStatus::Fail
-    };
-    let _ = status_tx.send(Some(status));
-    (file_name, result)
+    (file_name, stage_file::<T>(pool, file_name).await)
 }
 
 async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
@@ -413,6 +385,9 @@ async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
     config.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
+    config.pool = Some(deadpool_postgres::PoolConfig::new(
+        config::CONFIG.postgres_max_pool_size,
+    ));
 
     match config.create_pool(Some(Runtime::Tokio1), NoTls) {
         Ok(pool) => Ok(pool),
@@ -420,29 +395,317 @@ async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
     }
 }
 
-async fn get_source(pool: Pool) -> Result<i16, Box<dyn std::error::Error>> {
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(err) => return Err(Box::new(err)),
-    };
-
-    let row = match client
+async fn get_source(client: &Client) -> Result<i16, Box<dyn std::error::Error + Send + Sync>> {
+    let row = client
         .query_one("SELECT id FROM sources WHERE name = 'flibusta';", &[])
-        .await
-    {
-        Ok(v) => v,
-        Err(err) => return Err(Box::new(err)),
-    };
+        .await?;
 
-    let id = row.get(0);
-
-    Ok(id)
+    Ok(row.get(0))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum UpdateStatus {
-    Success,
-    Fail,
+/// Compares the number of rows staged for `staging_table` against the
+/// number currently present in the DB (via `target_count_sql`, parameterized
+/// by `$1 = source_id`) and fails if the staged count looks like a
+/// truncated/partial dump. Skipped when the DB-side count is 0 (first run
+/// ever for this source - there's nothing to compare against, and the
+/// anti-join deletes are harmless on an empty table anyway).
+///
+/// This is a deliberate safety gate: the merge transaction's anti-join
+/// deletes (`crate::merge::MERGE_PLAN`, steps "books soft-delete removed"
+/// and friends) would otherwise happily wipe the whole catalog if a
+/// truncated/corrupt dump made it through staging.
+pub async fn check_staging_ratio(
+    client: &Client,
+    staging_table: &str,
+    target_count_sql: &str,
+    source_id: i16,
+    label: &str,
+    min_ratio: f64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let staged: i64 = client
+        .query_one(&format!("SELECT COUNT(*) FROM {staging_table}"), &[])
+        .await?
+        .get(0);
+    let target: i64 = client
+        .query_one(target_count_sql, &[&source_id])
+        .await?
+        .get(0);
+
+    if target == 0 {
+        // First run ever for this source: nothing to compare against.
+        return Ok(());
+    }
+
+    let ratio = staged as f64 / target as f64;
+
+    if ratio < min_ratio {
+        return Err(format!(
+            "sanity check failed for {label}: staged={staged} target={target} ratio={ratio:.3} < min_staging_ratio={min_ratio} \
+             (looks like a truncated/partial dump; aborting before the merge transaction to avoid wiping the catalog)"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+pub async fn sanity_check(
+    pool: &Pool,
+    source_id: i16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = pool.get().await?;
+    let min_ratio = config::CONFIG.min_staging_ratio;
+
+    check_staging_ratio(
+        &client,
+        "staging_books",
+        "SELECT COUNT(*) FROM books WHERE source = $1 AND NOT is_deleted",
+        source_id,
+        "books",
+        min_ratio,
+    )
+    .await?;
+
+    check_staging_ratio(
+        &client,
+        "staging_book_authors",
+        "SELECT COUNT(*) FROM book_authors ba JOIN books b ON b.id = ba.book WHERE b.source = $1",
+        source_id,
+        "book_authors",
+        min_ratio,
+    )
+    .await?;
+
+    check_staging_ratio(
+        &client,
+        "staging_book_genres",
+        "SELECT COUNT(*) FROM book_genres bg JOIN books b ON b.id = bg.book WHERE b.source = $1",
+        source_id,
+        "book_genres",
+        min_ratio,
+    )
+    .await?;
+
+    check_staging_ratio(
+        &client,
+        "staging_translations",
+        "SELECT COUNT(*) FROM translations t JOIN books b ON b.id = t.book WHERE b.source = $1",
+        source_id,
+        "translations",
+        min_ratio,
+    )
+    .await?;
+
+    check_staging_ratio(
+        &client,
+        "staging_book_sequences",
+        "SELECT COUNT(*) FROM book_sequences bs JOIN books b ON b.id = bs.book WHERE b.source = $1",
+        source_id,
+        "book_sequences",
+        min_ratio,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Aggregates the per-file Phase A outcomes (after `JoinHandle`s have
+/// already been awaited) into total `StageStats` and a list of failure
+/// messages, one per failed file. Pure and I/O-free, so the orchestration
+/// invariant it encodes - **any single failed `stage_file` task fails the
+/// whole batch** (the caller only proceeds to `load_and_merge_transaction`,
+/// i.e. only starts the merge transaction, when the returned failure list
+/// is empty) - is directly unit-testable without a DB or network.
+///
+/// This replaces the old (Spec 01-obsoleted) 12-way watch-channel
+/// dependency graph, where a failing dependency had to fail its specific
+/// dependents within a bounded time. Phase A tasks are now fully
+/// independent of each other, so the only orchestration invariant left to
+/// prove is this simpler one: any failure anywhere in Phase A -> no Phase B.
+fn aggregate_stage_outcomes(outcomes: Vec<StageOutcome>) -> (StageStats, Vec<String>) {
+    let mut failures = Vec::new();
+    let mut total_staged: u64 = 0;
+    let mut total_skipped: u64 = 0;
+
+    for (file_name, result) in outcomes {
+        match result {
+            Ok(stats) => {
+                total_staged += stats.staged;
+                total_skipped += stats.skipped;
+            }
+            Err(err) => failures.push(format!("{file_name}: {err}")),
+        }
+    }
+
+    (
+        StageStats {
+            staged: total_staged,
+            skipped: total_skipped,
+        },
+        failures,
+    )
+}
+
+/// Phase A + Phase B: truncate staging tables, load all 12 dump files into
+/// them concurrently (Phase A, no inter-task dependencies), sanity-check the
+/// staged row counts, then run the whole `crate::merge::MERGE_PLAN` inside
+/// one transaction (Phase B) so readers only ever see the previous complete
+/// catalog or the new complete catalog for each entity - never a mix.
+///
+/// Returns the aggregate `StageStats` (rows staged/skipped across all 12
+/// files) alongside the outcome, regardless of success or failure, so the
+/// caller can persist them into `catalog_updates.rows_staged`/`rows_skipped`
+/// even when the run fails partway through.
+async fn load_and_merge(
+    pool: &Pool,
+    source_id: i16,
+) -> (
+    StageStats,
+    Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) {
+    let truncate_client = match pool.get().await {
+        Ok(v) => v,
+        Err(err) => return (StageStats::default(), Err(Box::new(err))),
+    };
+    if let Err(err) = truncate_client
+        .batch_execute(crate::schema::TRUNCATE_ALL_STAGING_SQL)
+        .await
+    {
+        return (StageStats::default(), Err(Box::new(err)));
+    }
+    drop(truncate_client);
+
+    let handles = vec![
+        tokio::spawn(stage_task::<Author>(pool.clone(), "lib.libavtorname.sql")),
+        tokio::spawn(stage_task::<Book>(pool.clone(), "lib.libbook.sql")),
+        tokio::spawn(stage_task::<BookAuthor>(pool.clone(), "lib.libavtor.sql")),
+        tokio::spawn(stage_task::<Translator>(
+            pool.clone(),
+            "lib.libtranslator.sql",
+        )),
+        tokio::spawn(stage_task::<Sequence>(pool.clone(), "lib.libseqname.sql")),
+        tokio::spawn(stage_task::<SequenceInfo>(pool.clone(), "lib.libseq.sql")),
+        tokio::spawn(stage_task::<BookAnnotation>(
+            pool.clone(),
+            "lib.b.annotations.sql",
+        )),
+        tokio::spawn(stage_task::<BookAnnotationPic>(
+            pool.clone(),
+            "lib.b.annotations_pics.sql",
+        )),
+        tokio::spawn(stage_task::<AuthorAnnotation>(
+            pool.clone(),
+            "lib.a.annotations.sql",
+        )),
+        tokio::spawn(stage_task::<AuthorAnnotationPic>(
+            pool.clone(),
+            "lib.a.annotations_pics.sql",
+        )),
+        tokio::spawn(stage_task::<Genre>(pool.clone(), "lib.libgenrelist.sql")),
+        tokio::spawn(stage_task::<BookGenre>(pool.clone(), "lib.libgenre.sql")),
+    ];
+
+    let mut outcomes: Vec<StageOutcome> = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        match handle.await {
+            Ok((file_name, result)) => outcomes.push((file_name, result)),
+            Err(join_err) => outcomes.push((
+                "<task join error>",
+                Err(Box::new(std::io::Error::other(join_err.to_string()))),
+            )),
+        }
+    }
+
+    for (file_name, result) in &outcomes {
+        match result {
+            Ok(stats) if stats.skipped > 0 => {
+                log::warn!(
+                    "{file_name}: {} row(s) skipped while staging",
+                    stats.skipped
+                );
+            }
+            Ok(_) => (),
+            Err(_) => {
+                RUN_STATE.errors_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let (stats, failures) = aggregate_stage_outcomes(outcomes);
+
+    RUN_STATE
+        .rows_processed_total
+        .fetch_add(stats.staged, Ordering::Relaxed);
+    RUN_STATE
+        .rows_skipped_total
+        .fetch_add(stats.skipped, Ordering::Relaxed);
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            log::error!("{failure}");
+        }
+        // Staging tables are invisible to readers regardless of outcome, and
+        // (per `aggregate_stage_outcomes`) a single failing stage_file task
+        // is fatal to the whole Phase A batch, so it's safe - and required -
+        // to bail out here without ever calling
+        // `load_and_merge_transaction`, i.e. without touching production
+        // tables. See `aggregate_stage_outcomes_one_failure_fails_the_whole_batch`
+        // for the unit-level proof of this invariant (the direct
+        // replacement for the old 12-way dependency-graph orchestration
+        // test, which Spec 01 made obsolete by removing the dependency
+        // graph entirely - Phase A tasks are now fully independent).
+        return (stats, Err(failures.join("; ").into()));
+    }
+
+    match load_and_merge_transaction(pool, source_id).await {
+        Ok(()) => (stats, Ok(())),
+        Err(err) => {
+            RUN_STATE.errors_total.fetch_add(1, Ordering::Relaxed);
+            (stats, Err(err))
+        }
+    }
+}
+
+/// Phase B proper: sanity-check the staged row counts, then run the whole
+/// `crate::merge::MERGE_PLAN` inside one transaction.
+async fn load_and_merge_transaction(
+    pool: &Pool,
+    source_id: i16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sanity_check(pool, source_id).await?;
+
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+
+    tx.batch_execute(&format!(
+        "SET LOCAL statement_timeout = '30min'; SET LOCAL lock_timeout = '30s'; SET LOCAL work_mem = '{}';",
+        config::CONFIG.merge_work_mem
+    ))
+    .await?;
+
+    tx.batch_execute(crate::schema::ANALYZE_ALL_STAGING_SQL)
+        .await?;
+
+    for step in crate::merge::MERGE_PLAN {
+        log::info!("merge step: {}", step.name);
+        match step.params {
+            crate::merge::Params::None => {
+                tx.batch_execute(step.sql).await?;
+            }
+            crate::merge::Params::Source => {
+                tx.execute(step.sql, &[&source_id]).await?;
+            }
+            crate::merge::Params::SourceLangs => {
+                tx.execute(step.sql, &[&source_id, &config::CONFIG.allowed_langs])
+                    .await?;
+            }
+        }
+    }
+
+    tx.commit().await?;
+
+    Ok(())
 }
 
 const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
@@ -613,10 +876,20 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => RUN_STATE.end_run(true, "success".to_string()),
         Err(err) => RUN_STATE.end_run(false, err.to_string()),
     }
-    result
+    // Widen `Box<dyn Error + Send + Sync>` (used internally so the update
+    // future stays `Send` across the advisory-lock release await) to the
+    // plain `Box<dyn Error>` of this function's public signature. A no-op
+    // unsized coercion, not a lossy conversion - the source chain consumed
+    // by `sentry::capture_error` in main.rs is unaffected.
+    result.map_err(|err| err as Box<dyn std::error::Error>)
 }
 
-async fn run_update_inner() -> Result<(), Box<dyn std::error::Error>> {
+/// Postgres advisory lock key for the whole catalog-update run. A fixed,
+/// well-known string hashed via `hashtext` rather than a magic numeric
+/// constant, to make the lock's purpose obvious in `pg_locks`.
+const ADVISORY_LOCK_SQL_KEY: &str = "library_updater:catalog_update";
+
+async fn run_update_inner() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!("Start update...");
 
     match tokio::fs::create_dir_all(&config::CONFIG.data_dir).await {
@@ -636,158 +909,121 @@ async fn run_update_inner() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(Box::new(err)),
     };
 
-    let source_id = match get_source(pool.clone()).await {
-        Ok(v) => v,
-        Err(err) => return Err(err),
+    let client = pool.get().await?;
+    crate::schema::ensure(&client).await?;
+
+    // Postgres-level advisory lock, in addition to the process-local
+    // `UPDATE_LOCK` mutex: the mutex only prevents two update runs within
+    // the *same* process from overlapping, but this service can run as
+    // multiple replicas / get restarted mid-run, and all instances share
+    // the same mutable staging tables (a TRUNCATE from one racing a COPY
+    // from another would corrupt an in-flight load). Held on a dedicated
+    // connection for the whole run and explicitly released before that
+    // connection goes back to the pool, since deadpool reuses sessions and
+    // an un-released advisory lock would otherwise "leak" onto whichever
+    // future pool user happens to be handed this same backend.
+    let lock_client = pool.get().await?;
+    let locked: bool = lock_client
+        .query_one(
+            "SELECT pg_try_advisory_lock(hashtext($1))",
+            &[&ADVISORY_LOCK_SQL_KEY],
+        )
+        .await?
+        .get(0);
+
+    if !locked {
+        return Err(format!(
+            "another catalog update is already holding the Postgres advisory lock ({ADVISORY_LOCK_SQL_KEY}); refusing to start a concurrent run"
+        )
+        .into());
+    }
+
+    let source_id = get_source(&client).await?;
+
+    let result = run_update_body(&pool, &client, source_id).await;
+
+    if let Err(unlock_err) = lock_client
+        .execute(
+            "SELECT pg_advisory_unlock(hashtext($1))",
+            &[&ADVISORY_LOCK_SQL_KEY],
+        )
+        .await
+    {
+        log::error!("failed to release Postgres advisory lock: {unlock_err}");
+    }
+    drop(lock_client);
+
+    result
+}
+
+/// The actual update body, run while holding both the process-local
+/// `UPDATE_LOCK` and the Postgres advisory lock acquired by the caller.
+async fn run_update_body(
+    pool: &Pool,
+    client: &Client,
+    source_id: i16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Repair bookkeeping left behind by a killed/crashed previous process:
+    // a run still marked 'running' after a full day definitely didn't
+    // finish cleanly. Scoped by `started_at` age (rather than any 'running'
+    // row) so this can't clobber a legitimately-running peer whose merge is
+    // just taking a while - the Postgres advisory lock above is what
+    // actually prevents concurrent runs; this is only cleanup for rows
+    // orphaned by a hard process kill.
+    client
+        .execute(
+            "UPDATE catalog_updates SET status = 'failed', finished_at = now(), error = 'abandoned (process restart)' WHERE status = 'running' AND started_at < now() - interval '1 day'",
+            &[],
+        )
+        .await?;
+
+    let run_id: i64 = client
+        .query_one(
+            "INSERT INTO catalog_updates (source, status) VALUES ($1, 'running') RETURNING id",
+            &[&source_id],
+        )
+        .await?
+        .get(0);
+
+    let (stats, result) = load_and_merge(pool, source_id).await;
+
+    let (status, err_message): (&str, Option<String>) = match &result {
+        Ok(_) => ("success", None),
+        Err(e) => ("failed", Some(e.to_string())),
     };
 
-    let (author_tx, author_rx) = tokio::sync::watch::channel(None);
-    let (book_tx, book_rx) = tokio::sync::watch::channel(None);
-    let (book_author_tx, _book_author_rx) = tokio::sync::watch::channel(None);
-    let (translator_tx, _translator_rx) = tokio::sync::watch::channel(None);
-    let (sequence_tx, sequence_rx) = tokio::sync::watch::channel(None);
-    let (sequence_info_tx, _sequence_info_rx) = tokio::sync::watch::channel(None);
-    let (book_annotation_tx, book_annotation_rx) = tokio::sync::watch::channel(None);
-    let (book_annotation_pics_tx, _book_annotation_pics_rx) = tokio::sync::watch::channel(None);
-    let (author_annotation_tx, author_annotation_rx) = tokio::sync::watch::channel(None);
-    let (author_annotation_pics_tx, _author_annotation_pics_rx) = tokio::sync::watch::channel(None);
-    let (genre_tx, genre_rx) = tokio::sync::watch::channel(None);
-    let (book_genre_tx, _book_genre_rx) = tokio::sync::watch::channel(None);
+    let staged_i64 = stats.staged as i64;
+    let skipped_i64 = stats.skipped as i64;
 
-    let author_process = tokio::spawn(run_task::<Author>(
-        pool.clone(),
-        source_id,
-        "lib.libavtorname.sql",
-        vec![],
-        author_tx,
-    ));
-
-    let book_process = tokio::spawn(run_task::<Book>(
-        pool.clone(),
-        source_id,
-        "lib.libbook.sql",
-        vec![],
-        book_tx,
-    ));
-
-    let book_author_process = tokio::spawn(run_task::<BookAuthor>(
-        pool.clone(),
-        source_id,
-        "lib.libavtor.sql",
-        vec![author_rx.clone(), book_rx.clone()],
-        book_author_tx,
-    ));
-
-    let translator_process = tokio::spawn(run_task::<Translator>(
-        pool.clone(),
-        source_id,
-        "lib.libtranslator.sql",
-        vec![author_rx.clone(), book_rx.clone()],
-        translator_tx,
-    ));
-
-    let sequence_process = tokio::spawn(run_task::<Sequence>(
-        pool.clone(),
-        source_id,
-        "lib.libseqname.sql",
-        vec![],
-        sequence_tx,
-    ));
-
-    let sequence_info_process = tokio::spawn(run_task::<SequenceInfo>(
-        pool.clone(),
-        source_id,
-        "lib.libseq.sql",
-        vec![book_rx.clone(), sequence_rx.clone()],
-        sequence_info_tx,
-    ));
-
-    let book_annotation_process = tokio::spawn(run_task::<BookAnnotation>(
-        pool.clone(),
-        source_id,
-        "lib.b.annotations.sql",
-        vec![book_rx.clone()],
-        book_annotation_tx,
-    ));
-
-    let book_annotation_pics_process = tokio::spawn(run_task::<BookAnnotationPic>(
-        pool.clone(),
-        source_id,
-        "lib.b.annotations_pics.sql",
-        vec![book_annotation_rx.clone()],
-        book_annotation_pics_tx,
-    ));
-
-    let author_annotation_process = tokio::spawn(run_task::<AuthorAnnotation>(
-        pool.clone(),
-        source_id,
-        "lib.a.annotations.sql",
-        vec![author_rx.clone()],
-        author_annotation_tx,
-    ));
-
-    let author_annotation_pics_process = tokio::spawn(run_task::<AuthorAnnotationPic>(
-        pool.clone(),
-        source_id,
-        "lib.a.annotations_pics.sql",
-        vec![author_annotation_rx.clone()],
-        author_annotation_pics_tx,
-    ));
-
-    let genre_process = tokio::spawn(run_task::<Genre>(
-        pool.clone(),
-        source_id,
-        "lib.libgenrelist.sql",
-        vec![],
-        genre_tx,
-    ));
-
-    let book_genre_process = tokio::spawn(run_task::<BookGenre>(
-        pool.clone(),
-        source_id,
-        "lib.libgenre.sql",
-        vec![genre_rx.clone(), book_rx.clone()],
-        book_genre_tx,
-    ));
-
-    let handles = [
-        author_process,
-        book_process,
-        book_author_process,
-        translator_process,
-        sequence_process,
-        sequence_info_process,
-        book_annotation_process,
-        book_annotation_pics_process,
-        author_annotation_process,
-        author_annotation_pics_process,
-        genre_process,
-        book_genre_process,
-    ];
-
-    let mut failures: Vec<String> = Vec::new();
-
-    for handle in handles {
-        match handle.await {
-            Ok((file_name, Ok(()))) => {
-                let _ = file_name;
+    // The bookkeeping UPDATE below is best-effort: if it fails, we still
+    // want to propagate `result` (the real, typed error whose source chain
+    // is what `sentry::capture_error` in main.rs consumes) rather than
+    // masking it with a bookkeeping failure.
+    match pool.get().await {
+        Ok(bookkeeping_client) => {
+            if let Err(update_err) = bookkeeping_client
+                .execute(
+                    "UPDATE catalog_updates SET status = $2, finished_at = now(), error = $3, rows_staged = $4, rows_skipped = $5 WHERE id = $1",
+                    &[&run_id, &status, &err_message, &staged_i64, &skipped_i64],
+                )
+                .await
+            {
+                log::error!(
+                    "failed to write final catalog_updates bookkeeping for run {run_id}: {update_err}"
+                );
             }
-            Ok((file_name, Err(err))) => {
-                failures.push(format!("{file_name}: {err}"));
-            }
-            Err(join_err) => {
-                failures.push(format!("join error: {join_err}"));
-            }
+        }
+        Err(pool_err) => {
+            log::error!(
+                "failed to get a pool connection for final catalog_updates bookkeeping for run {run_id}: {pool_err}"
+            );
         }
     }
 
-    if !failures.is_empty() {
-        for failure in &failures {
-            log::error!("{failure}");
-        }
-
-        return Err(Box::new(std::io::Error::other(failures.join("; "))));
-    }
+    // Propagate the original, typed `result` (not a stringified version)
+    // now that the bookkeeping UPDATE above has run - its own failure was
+    // logged separately above rather than masking this one.
+    result?;
 
     match send_webhooks().await {
         Ok(_) => {
@@ -956,5 +1192,131 @@ mod tests {
         assert!(!part_path.exists(), "part file must be cleaned up");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- parse_insert_values ---
+
+    #[test]
+    fn parse_insert_values_single_row() {
+        let line = "INSERT INTO `libavtorname` VALUES (1,'John','','Doe');";
+        let rows = parse_insert_values(line);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 4);
+    }
+
+    #[test]
+    fn parse_insert_values_multiple_rows_in_one_statement() {
+        let line = "INSERT INTO `libavtorname` VALUES (1,'John','','Doe'),(2,'Jane','','Roe');";
+        let rows = parse_insert_values(line);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parse_insert_values_returns_empty_for_non_insert_lines() {
+        assert!(parse_insert_values("").is_empty());
+        assert!(parse_insert_values("LOCK TABLES `libavtorname` WRITE;").is_empty());
+        assert!(parse_insert_values("UNLOCK TABLES;").is_empty());
+        assert!(parse_insert_values("-- a comment").is_empty());
+    }
+
+    #[test]
+    fn parse_insert_values_returns_empty_for_malformed_line() {
+        assert!(parse_insert_values("INSERT INTO `x` VALUES (1, 'unterminated").is_empty());
+    }
+
+    // --- aggregate_stage_outcomes ---
+    //
+    // These prove the orchestration invariant that replaces the old (Spec
+    // 01-obsoleted) "a failing dependency fails dependents within bounded
+    // time" test: since Phase A `stage_file` tasks have no dependencies on
+    // each other any more, the only invariant left is that a single failed
+    // task fails the *whole* Phase A batch, which `load_and_merge` uses to
+    // decide never to call `load_and_merge_transaction` (i.e. the merge
+    // transaction, and therefore any write to production tables, never
+    // starts).
+
+    #[test]
+    fn aggregate_stage_outcomes_all_success_has_no_failures() {
+        let outcomes: Vec<StageOutcome> = vec![
+            (
+                "authors",
+                Ok(StageStats {
+                    staged: 5,
+                    skipped: 0,
+                }),
+            ),
+            (
+                "books",
+                Ok(StageStats {
+                    staged: 3,
+                    skipped: 1,
+                }),
+            ),
+        ];
+
+        let (stats, failures) = aggregate_stage_outcomes(outcomes);
+
+        assert!(failures.is_empty());
+        assert_eq!(stats.staged, 8);
+        assert_eq!(stats.skipped, 1);
+    }
+
+    #[test]
+    fn aggregate_stage_outcomes_one_failure_fails_the_whole_batch() {
+        let outcomes: Vec<StageOutcome> = vec![
+            (
+                "good_file",
+                Ok(StageStats {
+                    staged: 5,
+                    skipped: 0,
+                }),
+            ),
+            (
+                "bad_file",
+                Err(Box::new(std::io::Error::other("boom"))
+                    as Box<dyn std::error::Error + Send + Sync>),
+            ),
+            (
+                "another_good_file",
+                Ok(StageStats {
+                    staged: 2,
+                    skipped: 0,
+                }),
+            ),
+        ];
+
+        let (stats, failures) = aggregate_stage_outcomes(outcomes);
+
+        assert_eq!(
+            failures.len(),
+            1,
+            "exactly the one failing file must be reported as a failure"
+        );
+        assert!(failures[0].contains("bad_file"));
+        assert!(failures[0].contains("boom"));
+        // Stats from the files that did succeed are still aggregated for
+        // bookkeeping (`catalog_updates.rows_staged`/`rows_skipped`), even
+        // though the batch as a whole is treated as failed by the caller.
+        assert_eq!(stats.staged, 7);
+    }
+
+    #[test]
+    fn aggregate_stage_outcomes_multiple_failures_are_all_reported() {
+        let outcomes: Vec<StageOutcome> = vec![
+            (
+                "bad_file_1",
+                Err(Box::new(std::io::Error::other("network error"))
+                    as Box<dyn std::error::Error + Send + Sync>),
+            ),
+            (
+                "bad_file_2",
+                Err(Box::new(std::io::Error::other("parse error"))
+                    as Box<dyn std::error::Error + Send + Sync>),
+            ),
+        ];
+
+        let (_stats, failures) = aggregate_stage_outcomes(outcomes);
+
+        assert_eq!(failures.len(), 2);
     }
 }

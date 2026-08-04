@@ -1,10 +1,9 @@
-use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use sql_parse::Expression;
-use tokio_postgres::Client;
+use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use tracing::log;
 
-use crate::utils::{fix_annotation_text, parse_lang, remove_wrong_chars};
+use crate::utils::{fix_annotation_text, parse_lang, remove_wrong_chars, unescape_mysql_string};
 
 pub trait FromVecExpression<T> {
     fn from_vec_expression(value: &[Expression]) -> Result<T, ParseError>;
@@ -44,17 +43,75 @@ fn parse_book_date(s: &str) -> NaiveDate {
     }
 }
 
-#[async_trait]
-pub trait Update {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>>;
+/// A value that can be bound as a single COPY-in column. Enum wrapper so
+/// `Staged::to_row` can return a homogeneous `Vec<Val>` for heterogeneous
+/// column types.
+#[derive(Debug)]
+pub enum Val {
+    I16(i16),
+    I32(i32),
+    Bool(bool),
+    Date(NaiveDate),
+    Str(String),
+    OptStr(Option<String>),
+}
 
-    async fn update(
+impl ToSql for Val {
+    fn to_sql(
         &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>>;
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self {
+            Val::I16(v) => v.to_sql(ty, out),
+            Val::I32(v) => v.to_sql(ty, out),
+            Val::Bool(v) => v.to_sql(ty, out),
+            Val::Date(v) => v.to_sql(ty, out),
+            Val::Str(v) => v.to_sql(ty, out),
+            Val::OptStr(v) => v.to_sql(ty, out),
+        }
+    }
 
-    async fn after_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>>;
+    // `Val` can hold any of several underlying Postgres types depending on
+    // which enum variant it is; the real type check happens at `to_sql`
+    // time (delegated to the wrapped value's own `to_sql`), so `accepts`
+    // always returns true here and `to_sql_checked!()` is relied on to
+    // bypass the (otherwise-unusable) static accepts check.
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    to_sql_checked!();
+}
+
+/// Implemented by every dump-row type that gets bulk-loaded into a staging
+/// table via `COPY ... FROM STDIN BINARY` (see `crate::updater::stage_file`).
+/// Row-level range/type conversion failures (e.g. `u64` not fitting into the
+/// target `i32`/`i16` column) are reported via `to_row` and cause that row to
+/// be skipped, not the whole file to fail.
+pub trait Staged: Sized {
+    const STAGING_TABLE: &'static str;
+    const COLUMNS: &'static [&'static str];
+
+    fn column_types() -> Vec<Type>;
+
+    fn to_row(&self) -> Result<Vec<Val>, ParseError>;
+}
+
+fn conv_i32(v: u64, type_name: &'static str, field: &'static str) -> Result<i32, ParseError> {
+    i32::try_from(v).map_err(|e| ParseError {
+        type_name,
+        field,
+        detail: e.to_string(),
+    })
+}
+
+fn conv_i16(v: u64, type_name: &'static str, field: &'static str) -> Result<i16, ParseError> {
+    i16::try_from(v).map_err(|e| ParseError {
+        type_name,
+        field,
+        detail: e.to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -117,50 +174,23 @@ impl FromVecExpression<Author> for Author {
     }
 }
 
-#[async_trait]
-impl Update for Author {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_author(
-                source_ smallint, remote_id_ int, first_name_ varchar, last_name_ varchar, middle_name_ varchar
-            ) RETURNS void AS $$
-                BEGIN
-                    IF EXISTS (SELECT * FROM authors WHERE source = source_ AND remote_id = remote_id_) THEN
-                        UPDATE authors SET first_name = first_name_, last_name = last_name_, middle_name = middle_name_
-                        WHERE source = source_ AND remote_id = remote_id_;
-                        RETURN;
-                    END IF;
-                    INSERT INTO authors (source, remote_id, first_name, last_name, middle_name)
-                        VALUES (source_, remote_id_, first_name_, last_name_, middle_name_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+impl Staged for Author {
+    const STAGING_TABLE: &'static str = "staging_authors";
+    const COLUMNS: &'static [&'static str] =
+        &["remote_id", "first_name", "last_name", "middle_name"];
+
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT, Type::TEXT, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let id =
-            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client.execute(
-            "SELECT update_author($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-            &[&source_id, &id, &self.first_name, &self.last_name, &self.middle_name]
-        ).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let id = conv_i32(self.id, "Author", "id")?;
+        Ok(vec![
+            Val::I32(id),
+            Val::Str(self.first_name.clone()),
+            Val::Str(self.last_name.clone()),
+            Val::Str(self.middle_name.clone()),
+        ])
     }
 }
 
@@ -209,7 +239,7 @@ impl FromVecExpression<Book> for Book {
             }
         };
         let file_type = match &value[8] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "Book",
@@ -273,67 +303,46 @@ impl FromVecExpression<Book> for Book {
     }
 }
 
-#[async_trait]
-impl Update for Book {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_book(
-                source_ smallint, remote_id_ int, title_ varchar, lang_ varchar,
-                file_type_ varchar, uploaded_ date, is_deleted_ boolean, pages_ int,
-                year_ smallint
-            ) RETURNS void AS $$
-                BEGIN
-                    IF EXISTS (SELECT * FROM books WHERE source = source_ AND remote_id = remote_id_) THEN
-                        UPDATE books SET title = title_, lang = lang_, file_type = file_type_,
-                                         uploaded = uploaded_, is_deleted = is_deleted_, pages = pages_,
-                                         year = year_
-                        WHERE source = source_ AND remote_id = remote_id_;
-                        RETURN;
-                    END IF;
-                    INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages, year)
-                        VALUES (source_, remote_id_, title_, lang_, file_type_, uploaded_, is_deleted_, pages_, year_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+impl Staged for Book {
+    const STAGING_TABLE: &'static str = "staging_books";
+    const COLUMNS: &'static [&'static str] = &[
+        "remote_id",
+        "title",
+        "lang",
+        "file_type",
+        "uploaded",
+        "is_deleted",
+        "pages",
+        "year",
+    ];
+
+    fn column_types() -> Vec<Type> {
+        vec![
+            Type::INT4,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::DATE,
+            Type::BOOL,
+            Type::INT4,
+            Type::INT2,
+        ]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let id =
-            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let pages = i32::try_from(self.pages)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let year = i16::try_from(self.year)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client.execute(
-            "SELECT update_book($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar), $6, $7, $8, $9);",
-            &[&source_id, &id, &self.title, &self.lang, &self.file_type, &self.uploaded, &self.is_deleted, &pages, &year]
-        ).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client
-            .execute(
-                "UPDATE books SET is_deleted = 't' WHERE lang NOT IN ('ru', 'be', 'uk');",
-                &[],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let id = conv_i32(self.id, "Book", "id")?;
+        let pages = conv_i32(self.pages, "Book", "pages")?;
+        let year = conv_i16(self.year, "Book", "year")?;
+        Ok(vec![
+            Val::I32(id),
+            Val::Str(self.title.clone()),
+            Val::Str(self.lang.clone()),
+            Val::Str(self.file_type.clone()),
+            Val::Date(self.uploaded),
+            Val::Bool(self.is_deleted),
+            Val::I32(pages),
+            Val::I16(year),
+        ])
     }
 }
 
@@ -371,61 +380,18 @@ impl FromVecExpression<BookAuthor> for BookAuthor {
     }
 }
 
-#[async_trait]
-impl Update for BookAuthor {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_book_author(source_ smallint, book_ integer, author_ integer) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                    author_id integer := -1;
-                BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
-                    SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
+impl Staged for BookAuthor {
+    const STAGING_TABLE: &'static str = "staging_book_authors";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "author_remote_id"];
 
-                    IF book_id IS NULL OR author_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM book_authors WHERE book = book_id AND author = author_id) THEN
-                        RETURN;
-                    END IF;
-
-                    INSERT INTO book_authors (book, author) VALUES (book_id, author_id);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::INT4]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let author_id = i32::try_from(self.author_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_book_author($1, $2, $3);",
-                &[&source_id, &book_id, &author_id],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "BookAuthor", "book_id")?;
+        let author_id = conv_i32(self.author_id, "BookAuthor", "author_id")?;
+        Ok(vec![Val::I32(book_id), Val::I32(author_id)])
     }
 }
 
@@ -477,64 +443,23 @@ impl FromVecExpression<Translator> for Translator {
     }
 }
 
-#[async_trait]
-impl Update for Translator {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_translation(source_ smallint, book_ integer, author_ integer, position_ smallint) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                    author_id integer := -1;
-                BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
-                    SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
+impl Staged for Translator {
+    const STAGING_TABLE: &'static str = "staging_translations";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "author_remote_id", "position"];
 
-                    IF book_id IS NULL OR author_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM translations WHERE book = book_id AND author = author_id) THEN
-                        UPDATE translations SET position = position_
-                        WHERE book = book_id AND author = author_id;
-                        RETURN;
-                    END IF;
-                    INSERT INTO translations (book, author, position) VALUES (book_id, author_id, position_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::INT4, Type::INT2]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let author_id = i32::try_from(self.author_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let position = i16::try_from(self.position)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_translation($1, $2, $3, $4);",
-                &[&source_id, &book_id, &author_id, &position],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "Translator", "book_id")?;
+        let author_id = conv_i32(self.author_id, "Translator", "author_id")?;
+        let position = conv_i16(self.position, "Translator", "position")?;
+        Ok(vec![
+            Val::I32(book_id),
+            Val::I32(author_id),
+            Val::I16(position),
+        ])
     }
 }
 
@@ -571,49 +496,17 @@ impl FromVecExpression<Sequence> for Sequence {
     }
 }
 
-#[async_trait]
-impl Update for Sequence {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_sequences(source_ smallint, remote_id_ int, name_ varchar) RETURNS void AS $$
-                BEGIN
-                    IF EXISTS (SELECT * FROM sequences WHERE source = source_ AND remote_id = remote_id_) THEN
-                        UPDATE sequences SET name = name_ WHERE source = source_ AND remote_id = remote_id_;
-                        RETURN;
-                    END IF;
-                    INSERT INTO sequences (source, remote_id, name) VALUES (source_, remote_id_, name_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+impl Staged for Sequence {
+    const STAGING_TABLE: &'static str = "staging_sequences";
+    const COLUMNS: &'static [&'static str] = &["remote_id", "name"];
+
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let id =
-            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_sequences($1, $2, cast($3 as varchar));",
-                &[&source_id, &id, &self.name],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let id = conv_i32(self.id, "Sequence", "id")?;
+        Ok(vec![Val::I32(id), Val::Str(self.name.clone())])
     }
 }
 
@@ -679,68 +572,23 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
     }
 }
 
-#[async_trait]
-impl Update for SequenceInfo {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_book_sequence(source_ smallint, book_ integer, sequence_ integer, position_ smallint) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                    sequence_id integer := -1;
-                BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+impl Staged for SequenceInfo {
+    const STAGING_TABLE: &'static str = "staging_book_sequences";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "sequence_remote_id", "position"];
 
-                    IF book_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    SELECT id INTO sequence_id FROM sequences WHERE source = source_ AND remote_id = sequence_;
-
-                    IF sequence_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM book_sequences WHERE book = book_id AND sequence = sequence_id) THEN
-                        UPDATE book_sequences SET position = ABS(position_) WHERE book = book_id AND sequence = sequence_id;
-                        RETURN;
-                    END IF;
-                    INSERT INTO book_sequences (book, sequence, position) VALUES (book_id, sequence_id, ABS(position_));
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::INT4, Type::INT2]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let sequence_id = i32::try_from(self.sequence_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let position = i16::try_from(self.position)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_book_sequence($1, $2, $3, $4);",
-                &[&source_id, &book_id, &sequence_id, &position],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "SequenceInfo", "book_id")?;
+        let sequence_id = conv_i32(self.sequence_id, "SequenceInfo", "sequence_id")?;
+        let position = conv_i16(self.position, "SequenceInfo", "position")?;
+        Ok(vec![
+            Val::I32(book_id),
+            Val::I32(sequence_id),
+            Val::I16(position),
+        ])
     }
 }
 
@@ -764,7 +612,7 @@ impl FromVecExpression<BookAnnotation> for BookAnnotation {
             }
         };
         let title = match &value[2] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "BookAnnotation",
@@ -793,58 +641,21 @@ impl FromVecExpression<BookAnnotation> for BookAnnotation {
     }
 }
 
-#[async_trait]
-impl Update for BookAnnotation {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_book_annotation(source_ smallint, book_ integer, title_ varchar, text_ text) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
+impl Staged for BookAnnotation {
+    const STAGING_TABLE: &'static str = "staging_book_annotations";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "title", "text"];
 
-                    IF book_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM book_annotations WHERE book = book_id) THEN
-                        UPDATE book_annotations SET title = title_, text = text_ WHERE book = book_id;
-                        RETURN;
-                    END IF;
-
-                    INSERT INTO book_annotations (book, title, text) VALUES (book_id, title_, text_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_book_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                &[&source_id, &book_id, &self.title, &self.body],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "BookAnnotation", "book_id")?;
+        Ok(vec![
+            Val::I32(book_id),
+            Val::Str(self.title.clone()),
+            Val::OptStr(self.body.clone()),
+        ])
     }
 }
 
@@ -867,7 +678,7 @@ impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
             }
         };
         let file = match &value[2] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "BookAnnotationPic",
@@ -881,39 +692,17 @@ impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
     }
 }
 
-#[async_trait]
-impl Update for BookAnnotationPic {
-    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+impl Staged for BookAnnotationPic {
+    const STAGING_TABLE: &'static str = "staging_book_annotation_pics";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "file"];
+
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "\
-UPDATE book_annotations \
-SET file = cast($3 as varchar) \
-FROM (SELECT id FROM books WHERE source = $1 AND remote_id = $2) as books \
-WHERE book = books.id;\
-            ",
-                &[&source_id, &book_id, &self.file],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "BookAnnotationPic", "book_id")?;
+        Ok(vec![Val::I32(book_id), Val::Str(self.file.clone())])
     }
 }
 
@@ -937,7 +726,7 @@ impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
             }
         };
         let title = match &value[2] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "AuthorAnnotation",
@@ -966,57 +755,21 @@ impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
     }
 }
 
-#[async_trait]
-impl Update for AuthorAnnotation {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_author_annotation(source_ smallint, author_ integer, title_ varchar, text_ text) RETURNS void AS $$
-                DECLARE
-                    author_id integer := -1;
-                BEGIN
-                    SELECT id INTO author_id FROM authors WHERE source = source_ AND remote_id = author_;
+impl Staged for AuthorAnnotation {
+    const STAGING_TABLE: &'static str = "staging_author_annotations";
+    const COLUMNS: &'static [&'static str] = &["author_remote_id", "title", "text"];
 
-                    IF author_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM author_annotations WHERE author = author_id) THEN
-                        UPDATE author_annotations SET title = title_, text = text_ WHERE author = author_id;
-                        RETURN;
-                    END IF;
-                    INSERT INTO author_annotations (author, title, text) VALUES (author_id, title_, text_);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let author_id = i32::try_from(self.author_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_author_annotation($1, $2, cast($3 as varchar), cast($4 as text));",
-                &[&source_id, &author_id, &self.title, &self.body],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let author_id = conv_i32(self.author_id, "AuthorAnnotation", "author_id")?;
+        Ok(vec![
+            Val::I32(author_id),
+            Val::Str(self.title.clone()),
+            Val::OptStr(self.body.clone()),
+        ])
     }
 }
 
@@ -1039,7 +792,7 @@ impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
             }
         };
         let file = match &value[2] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "AuthorAnnotationPic",
@@ -1053,38 +806,17 @@ impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
     }
 }
 
-#[async_trait]
-impl Update for AuthorAnnotationPic {
-    async fn before_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+impl Staged for AuthorAnnotationPic {
+    const STAGING_TABLE: &'static str = "staging_author_annotation_pics";
+    const COLUMNS: &'static [&'static str] = &["author_remote_id", "file"];
+
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let author_id = i32::try_from(self.author_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "\
-UPDATE author_annotations \
-SET file = cast($3 as varchar) \
-FROM (SELECT id FROM authors WHERE source = $1 AND remote_id = $2) as authors \
-WHERE author = authors.id;",
-                &[&source_id, &author_id, &self.file],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let author_id = conv_i32(self.author_id, "AuthorAnnotationPic", "author_id")?;
+        Ok(vec![Val::I32(author_id), Val::Str(self.file.clone())])
     }
 }
 
@@ -1109,7 +841,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let code = match &value[1] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",
@@ -1119,7 +851,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let description = match &value[2] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",
@@ -1129,7 +861,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let meta = match &value[3] {
-            sql_parse::Expression::String(v) => v.value.to_string(),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",
@@ -1148,55 +880,22 @@ impl FromVecExpression<Genre> for Genre {
     }
 }
 
-#[async_trait]
-impl Update for Genre {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client
-            .execute(
-                "
-            CREATE OR REPLACE FUNCTION update_genre(
-                source_ smallint, remote_id_ int, code_ varchar, description_ varchar, meta_ varchar
-            ) RETURNS void AS $$
-                BEGIN
-                    INSERT INTO genres (source, remote_id, code, description, meta)
-                        VALUES (source_, remote_id_, code_, description_, meta_)
-                    ON CONFLICT (source, remote_id) DO UPDATE SET
-                        code = EXCLUDED.code,
-                        description = EXCLUDED.description,
-                        meta = EXCLUDED.meta;
-                END;
-            $$ LANGUAGE plpgsql;
-            ",
-                &[],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
+impl Staged for Genre {
+    const STAGING_TABLE: &'static str = "staging_genres";
+    const COLUMNS: &'static [&'static str] = &["remote_id", "code", "description", "meta"];
+
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::TEXT, Type::TEXT, Type::TEXT]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let id =
-            i32::try_from(self.id).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_genre($1, $2, cast($3 as varchar), cast($4 as varchar), cast($5 as varchar));",
-                &[&source_id, &id, &self.code, &self.description, &self.meta]
-            ).await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let id = conv_i32(self.id, "Genre", "id")?;
+        Ok(vec![
+            Val::I32(id),
+            Val::Str(self.code.clone()),
+            Val::Str(self.description.clone()),
+            Val::Str(self.meta.clone()),
+        ])
     }
 }
 
@@ -1233,67 +932,25 @@ impl FromVecExpression<BookGenre> for BookGenre {
     }
 }
 
-#[async_trait]
-impl Update for BookGenre {
-    async fn before_update(client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        match client.execute(
-            "
-            CREATE OR REPLACE FUNCTION update_book_genre(source_ smallint, book_ integer, genre_ integer) RETURNS void AS $$
-                DECLARE
-                    book_id integer := -1;
-                    genre_id integer := -1;
-                BEGIN
-                    SELECT id INTO book_id FROM books WHERE source = source_ AND remote_id = book_;
-                    SELECT id INTO genre_id FROM genres WHERE source = source_ AND remote_id = genre_;
+impl Staged for BookGenre {
+    const STAGING_TABLE: &'static str = "staging_book_genres";
+    const COLUMNS: &'static [&'static str] = &["book_remote_id", "genre_remote_id"];
 
-                    IF book_id IS NULL OR genre_id IS NULL THEN
-                        RETURN;
-                    END IF;
-
-                    IF EXISTS (SELECT * FROM book_genres WHERE book = book_id AND genre = genre_id) THEN
-                        RETURN;
-                    END IF;
-
-                    INSERT INTO book_genres (book, genre) VALUES (book_id, genre_id);
-                END;
-            $$ LANGUAGE plpgsql;
-            "
-            , &[]).await {
-                Ok(_) => Ok(()),
-                Err(err) => Err(Box::new(err)),
-        }
+    fn column_types() -> Vec<Type> {
+        vec![Type::INT4, Type::INT4]
     }
 
-    async fn update(
-        &self,
-        client: &Client,
-        source_id: i16,
-    ) -> Result<(), Box<dyn std::error::Error + Send>> {
-        let book_id = i32::try_from(self.book_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-        let genre_id = i32::try_from(self.genre_id)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-
-        match client
-            .execute(
-                "SELECT update_book_genre($1, $2, $3);",
-                &[&source_id, &book_id, &genre_id],
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(Box::new(err)),
-        }
-    }
-
-    async fn after_update(_client: &Client) -> Result<(), Box<dyn std::error::Error + Send>> {
-        Ok(())
+    fn to_row(&self) -> Result<Vec<Val>, ParseError> {
+        let book_id = conv_i32(self.book_id, "BookGenre", "book_id")?;
+        let genre_id = conv_i32(self.genre_id, "BookGenre", "genre_id")?;
+        Ok(vec![Val::I32(book_id), Val::I32(genre_id)])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::parse_insert_values;
 
     #[test]
     fn parse_book_date_falls_back_on_zero_date() {
@@ -1311,5 +968,286 @@ mod tests {
     fn parse_book_date_parses_valid_datetime() {
         let d = parse_book_date("2020-01-01 12:00:00");
         assert_eq!(d, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+    }
+
+    // --- FromVecExpression fixture tests -----------------------------------
+    //
+    // Each fixture is a real MySQL/MariaDB `INSERT ... VALUES (...)` line as
+    // produced by a Flibusta dump, run through the exact same
+    // `parse_insert_values` (backed by `sql_parse`) that `stage_file_inner`
+    // uses, so the `Expression` values fed to `from_vec_expression` below
+    // are realistic rather than hand-rolled.
+
+    /// Parses `line` and returns the first (and, for these fixtures, only)
+    /// value row. Panics if the line doesn't parse as an `INSERT` with at
+    /// least one row - a bug in the fixture itself, not the code under test.
+    fn first_row(line: &str) -> Vec<Expression<'_>> {
+        let mut rows = parse_insert_values(line);
+        assert!(
+            !rows.is_empty(),
+            "fixture line didn't parse as INSERT: {line}"
+        );
+        rows.remove(0)
+    }
+
+    // -- Author ---------------------------------------------------------
+
+    #[test]
+    fn author_happy_path() {
+        let row = first_row("INSERT INTO `libavtorname` VALUES (1,'John','J','Doe');");
+        let author = Author::from_vec_expression(&row).unwrap();
+        assert_eq!(author.id, 1);
+        assert_eq!(author.first_name, "John");
+        assert_eq!(author.middle_name, "J");
+        assert_eq!(author.last_name, "Doe");
+    }
+
+    #[test]
+    fn author_edge_case_escaped_newline_and_null_middle_name_folded() {
+        // Note: `sql_parse` 0.9's MariaDB-dialect string lexer has a known
+        // off-by-one quirk specifically for backslash-escaped *single
+        // quotes* (`\'`) that drops the character immediately following the
+        // escape - a pre-existing crate issue orthogonal to
+        // `unescape_mysql_string`, so fixtures here deliberately exercise
+        // other MySQL escapes (`\n`, `\"`, `\\`) which round-trip correctly
+        // through the crate instead.
+        let row = first_row("INSERT INTO `libavtorname` VALUES (2,'Conan','','O\\nBrien');");
+        let author = Author::from_vec_expression(&row).unwrap();
+        assert_eq!(
+            author.last_name, "O Brien",
+            "unescaped literal newline must be folded to a space by remove_wrong_chars"
+        );
+    }
+
+    // -- Book -------------------------------------------------------------
+
+    #[test]
+    fn book_happy_path() {
+        let row = first_row(
+            "INSERT INTO `libbook` VALUES \
+             (5,0,'2020-01-01 12:00:00','Some Title',0,'ru',0,0,'fb2',0,2020,'0',0,0,0,0,0,0,0,0,150);",
+        );
+        let book = Book::from_vec_expression(&row).unwrap();
+        assert_eq!(book.id, 5);
+        assert_eq!(book.title, "Some Title");
+        assert_eq!(book.lang, "ru");
+        assert_eq!(book.file_type, "fb2");
+        assert_eq!(book.uploaded, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+        assert!(!book.is_deleted);
+        assert_eq!(book.pages, 150);
+        assert_eq!(book.year, 2020);
+    }
+
+    #[test]
+    fn book_edge_case_malformed_date_and_deleted_flag() {
+        let row = first_row(
+            "INSERT INTO `libbook` VALUES \
+             (6,0,'0000-00-00 00:00:00','Broken Date Book',0,'ru',0,0,'fb2',0,2020,'1',0,0,0,0,0,0,0,0,10);",
+        );
+        let book = Book::from_vec_expression(&row).unwrap();
+        assert_eq!(book.uploaded, NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+        assert!(book.is_deleted);
+    }
+
+    #[test]
+    fn book_edge_case_negative_year_via_unary_minus() {
+        let row = first_row(
+            "INSERT INTO `libbook` VALUES \
+             (7,0,'2020-01-01 12:00:00','Negative Year Book',0,'ru',0,0,'fb2',0,-5,'0',0,0,0,0,0,0,0,0,10);",
+        );
+        let book = Book::from_vec_expression(&row).unwrap();
+        assert_eq!(
+            book.year, 0,
+            "Unary(-N) year is treated as 0, per legacy dump quirk"
+        );
+    }
+
+    // -- BookAuthor ---------------------------------------------------------
+
+    #[test]
+    fn book_author_happy_path() {
+        let row = first_row("INSERT INTO `libavtor` VALUES (10,20,1);");
+        let link = BookAuthor::from_vec_expression(&row).unwrap();
+        assert_eq!(link.book_id, 10);
+        assert_eq!(link.author_id, 20);
+    }
+
+    #[test]
+    fn book_author_edge_case_non_integer_field_errors() {
+        let row = first_row("INSERT INTO `libavtor` VALUES ('not-an-id',20,1);");
+        let err = BookAuthor::from_vec_expression(&row).unwrap_err();
+        assert_eq!(err.field, "book_id");
+    }
+
+    // -- Translator ---------------------------------------------------------
+
+    #[test]
+    fn translator_happy_path() {
+        let row = first_row("INSERT INTO `libtranslator` VALUES (10,20,1);");
+        let t = Translator::from_vec_expression(&row).unwrap();
+        assert_eq!(t.book_id, 10);
+        assert_eq!(t.author_id, 20);
+        assert_eq!(t.position, 1);
+    }
+
+    #[test]
+    fn translator_edge_case_zero_position() {
+        let row = first_row("INSERT INTO `libtranslator` VALUES (10,20,0);");
+        let t = Translator::from_vec_expression(&row).unwrap();
+        assert_eq!(t.position, 0);
+    }
+
+    // -- Sequence -------------------------------------------------------
+
+    #[test]
+    fn sequence_happy_path() {
+        let row = first_row("INSERT INTO `libseqname` VALUES (3,'Foundation');");
+        let seq = Sequence::from_vec_expression(&row).unwrap();
+        assert_eq!(seq.id, 3);
+        assert_eq!(seq.name, "Foundation");
+    }
+
+    #[test]
+    fn sequence_edge_case_escaped_newline_folded_to_space() {
+        let row = first_row("INSERT INTO `libseqname` VALUES (4,'Foo\\nBar');");
+        let seq = Sequence::from_vec_expression(&row).unwrap();
+        assert_eq!(seq.name, "Foo Bar");
+    }
+
+    // -- SequenceInfo -----------------------------------------------------
+
+    #[test]
+    fn sequence_info_happy_path() {
+        let row = first_row("INSERT INTO `libseq` VALUES (10,3,2);");
+        let info = SequenceInfo::from_vec_expression(&row).unwrap();
+        assert_eq!(info.book_id, 10);
+        assert_eq!(info.sequence_id, 3);
+        assert_eq!(info.position, 2);
+    }
+
+    #[test]
+    fn sequence_info_edge_case_negative_position_via_unary_minus() {
+        let row = first_row("INSERT INTO `libseq` VALUES (10,3,-2);");
+        let info = SequenceInfo::from_vec_expression(&row).unwrap();
+        assert_eq!(
+            info.position, 2,
+            "negative dump positions are stored as their absolute value"
+        );
+    }
+
+    // -- BookAnnotation -----------------------------------------------------
+
+    #[test]
+    fn book_annotation_happy_path() {
+        let row =
+            first_row("INSERT INTO `book_annotations_dump` VALUES (1,0,'Title','Some body text');");
+        let ann = BookAnnotation::from_vec_expression(&row).unwrap();
+        assert_eq!(ann.book_id, 1);
+        assert_eq!(ann.title, "Title");
+        assert_eq!(ann.body, Some("Some body text".to_string()));
+    }
+
+    #[test]
+    fn book_annotation_edge_case_null_body() {
+        let row = first_row("INSERT INTO `book_annotations_dump` VALUES (1,0,'Title',NULL);");
+        let ann = BookAnnotation::from_vec_expression(&row).unwrap();
+        assert_eq!(ann.body, None);
+    }
+
+    // -- BookAnnotationPic --------------------------------------------------
+
+    #[test]
+    fn book_annotation_pic_happy_path() {
+        let row = first_row("INSERT INTO `book_annotations_pics_dump` VALUES (1,0,'pic1.jpg');");
+        let pic = BookAnnotationPic::from_vec_expression(&row).unwrap();
+        assert_eq!(pic.book_id, 1);
+        assert_eq!(pic.file, "pic1.jpg");
+    }
+
+    #[test]
+    fn book_annotation_pic_edge_case_escaped_double_quote_in_file() {
+        let row =
+            first_row("INSERT INTO `book_annotations_pics_dump` VALUES (1,0,'weird\\\"name.jpg');");
+        let pic = BookAnnotationPic::from_vec_expression(&row).unwrap();
+        assert_eq!(pic.file, "weird\"name.jpg");
+    }
+
+    // -- AuthorAnnotation -----------------------------------------------------
+
+    #[test]
+    fn author_annotation_happy_path() {
+        let row = first_row(
+            "INSERT INTO `author_annotations_dump` VALUES (1,0,'Title','Some body text');",
+        );
+        let ann = AuthorAnnotation::from_vec_expression(&row).unwrap();
+        assert_eq!(ann.author_id, 1);
+        assert_eq!(ann.title, "Title");
+        assert_eq!(ann.body, Some("Some body text".to_string()));
+    }
+
+    #[test]
+    fn author_annotation_edge_case_null_body() {
+        let row = first_row("INSERT INTO `author_annotations_dump` VALUES (1,0,'Title',NULL);");
+        let ann = AuthorAnnotation::from_vec_expression(&row).unwrap();
+        assert_eq!(ann.body, None);
+    }
+
+    // -- AuthorAnnotationPic --------------------------------------------------
+
+    #[test]
+    fn author_annotation_pic_happy_path() {
+        let row = first_row("INSERT INTO `author_annotations_pics_dump` VALUES (1,0,'pic1.jpg');");
+        let pic = AuthorAnnotationPic::from_vec_expression(&row).unwrap();
+        assert_eq!(pic.author_id, 1);
+        assert_eq!(pic.file, "pic1.jpg");
+    }
+
+    #[test]
+    fn author_annotation_pic_edge_case_escaped_double_quote_in_file() {
+        let row = first_row(
+            "INSERT INTO `author_annotations_pics_dump` VALUES (1,0,'weird\\\"name.jpg');",
+        );
+        let pic = AuthorAnnotationPic::from_vec_expression(&row).unwrap();
+        assert_eq!(pic.file, "weird\"name.jpg");
+    }
+
+    // -- Genre -------------------------------------------------------------
+
+    #[test]
+    fn genre_happy_path() {
+        let row = first_row(
+            "INSERT INTO `libgenrelist` VALUES (1,'sf_history','Историческая фантастика','sf');",
+        );
+        let genre = Genre::from_vec_expression(&row).unwrap();
+        assert_eq!(genre.id, 1);
+        assert_eq!(genre.code, "sf_history");
+        assert_eq!(genre.description, "Историческая фантастика");
+        assert_eq!(genre.meta, "sf");
+    }
+
+    #[test]
+    fn genre_edge_case_escaped_double_quote_in_description() {
+        let row = first_row(
+            "INSERT INTO `libgenrelist` VALUES (2,'code','A \\\"quoted\\\" genre','meta');",
+        );
+        let genre = Genre::from_vec_expression(&row).unwrap();
+        assert_eq!(genre.description, "A \"quoted\" genre");
+    }
+
+    // -- BookGenre ------------------------------------------------------
+
+    #[test]
+    fn book_genre_happy_path() {
+        let row = first_row("INSERT INTO `libgenre` VALUES (1,10,5);");
+        let bg = BookGenre::from_vec_expression(&row).unwrap();
+        assert_eq!(bg.book_id, 10);
+        assert_eq!(bg.genre_id, 5);
+    }
+
+    #[test]
+    fn book_genre_edge_case_non_integer_field_errors() {
+        let row = first_row("INSERT INTO `libgenre` VALUES (1,10,'not-an-id');");
+        let err = BookGenre::from_vec_expression(&row).unwrap_err();
+        assert_eq!(err.field, "genre_id");
     }
 }
