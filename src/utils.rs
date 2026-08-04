@@ -4,6 +4,10 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+/// Reads `filename` line by line. Each line is buffered fully in memory
+/// (acceptable for current dump sizes, but note multi-megabyte lines are
+/// held entirely in RAM); invalid UTF-8 anywhere in the file surfaces as an
+/// `io::Error` when the corresponding item in the returned iterator is read.
 pub fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where
     P: AsRef<Path>,

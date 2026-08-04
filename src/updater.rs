@@ -1,11 +1,14 @@
 use std::fmt::Debug;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{self, Webhook};
 use deadpool_postgres::{Config, CreatePoolError, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use futures::{io::copy, TryStreamExt};
+use futures::{io::copy, Stream, StreamExt, TryStreamExt};
 use reqwest::header::HeaderMap;
-use tokio::fs::{remove_file, File};
+use tokio::fs::File;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_postgres::NoTls;
 use tracing::log;
@@ -25,12 +28,50 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::types::Book;
 
-async fn download_file(filename_str: &str) -> Result<(), Box<dyn std::error::Error + Send>> {
-    log::info!("Download {filename_str}...");
+lazy_static! {
+    static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(
+            config::CONFIG.download_connect_timeout_secs
+        ))
+        .build()
+        .expect("failed to build download http client");
+}
 
-    let link = format!("{}/sql/{filename_str}.gz", &config::CONFIG.fl_base_url);
+/// Wraps a byte stream so that if no new chunk arrives within `idle`, the
+/// stream yields a single `TimedOut` io::Error instead of hanging forever.
+fn with_idle_timeout<S>(
+    stream: S,
+    idle: Duration,
+) -> impl Stream<Item = Result<bytes::Bytes, std::io::Error>>
+where
+    S: Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    futures::stream::unfold(stream, move |mut s| async move {
+        match tokio::time::timeout(idle, futures::StreamExt::next(&mut s)).await {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), s)),
+            Ok(Some(Err(err))) => Some((Err(std::io::Error::other(err)), s)),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("download stalled: no bytes received for {idle:?}"),
+                )),
+                s,
+            )),
+        }
+    })
+}
 
-    let response = match reqwest::get(link).await {
+/// Performs a single download attempt: GET the url, stream+decompress the
+/// gzip body into `part_path`, and (if the server advertised a
+/// `Content-Length`) verify the compressed byte count matches.
+async fn download_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    part_path: &Path,
+    idle: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
+    let response = match client.get(url).send().await {
         Ok(v) => v,
         Err(err) => return Err(Box::new(err)),
     };
@@ -40,43 +81,161 @@ async fn download_file(filename_str: &str) -> Result<(), Box<dyn std::error::Err
         Err(err) => return Err(Box::new(err)),
     };
 
-    match remove_file(filename_str).await {
-        Ok(_) => (),
-        Err(err) => log::debug!("Can't remove file: {:?}", err),
-    };
+    let expected_len = response.content_length();
 
-    let mut file = match File::create(filename_str).await {
+    let mut file = match File::create(part_path).await {
         Ok(v) => v.compat(),
         Err(err) => {
-            log::error!("Can't create {filename_str}: {:?}", err);
+            log::error!("Can't create {}: {:?}", part_path.display(), err);
             return Err(Box::new(err));
         }
     };
 
-    let data = response
-        .bytes_stream()
-        .map_err(std::io::Error::other)
-        .into_async_read();
+    let byte_count = Arc::new(AtomicU64::new(0));
+    let byte_count_clone = byte_count.clone();
 
+    let stream = with_idle_timeout(Box::pin(response.bytes_stream()), idle);
+    let counted_stream = stream.inspect(move |chunk| {
+        if let Ok(chunk) = chunk {
+            byte_count_clone.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+    });
+
+    let data = counted_stream.into_async_read();
     let decoder = GzipDecoder::new(data);
 
     match copy(decoder, &mut file).await {
         Ok(_) => (),
         Err(err) => {
-            log::error!("Can't write data {filename_str}: {}", err);
             return Err(Box::new(err));
         }
     };
 
-    log::info!("{filename_str} downloaded!");
+    if let Some(expected) = expected_len {
+        let actual = byte_count.load(Ordering::Relaxed);
+        if actual != expected {
+            return Err(Box::new(std::io::Error::other(format!(
+                "downloaded {actual} compressed bytes but Content-Length was {expected}"
+            ))));
+        }
+    }
 
     Ok(())
+}
+
+/// Downloads `url` into `<dest_dir>/<file_name>.part`, retrying up to
+/// `max_attempts` times with exponential backoff, and only renames the part
+/// file to `<dest_dir>/<file_name>` on full success. Any failure at any
+/// point during an attempt deletes the `.part` file before retrying/failing.
+async fn download_file_with_client(
+    client: &reqwest::Client,
+    url: &str,
+    dest_dir: &Path,
+    file_name: &str,
+    idle: Duration,
+    max_attempts: u32,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
+    log::info!("Download {file_name}...");
+
+    let final_path = dest_dir.join(file_name);
+    let part_path = dest_dir.join(format!("{file_name}.part"));
+
+    let mut last_err: Option<Box<dyn std::error::Error + Send>> = None;
+
+    for attempt in 0..max_attempts {
+        let attempt_result = download_attempt(client, url, &part_path, idle).await;
+
+        match attempt_result {
+            Ok(()) => match tokio::fs::rename(&part_path, &final_path).await {
+                Ok(()) => {
+                    log::info!("{file_name} downloaded!");
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::error!(
+                        "download attempt {} for {file_name} failed to rename part file: {err}",
+                        attempt + 1
+                    );
+                    match tokio::fs::remove_file(&part_path).await {
+                        Ok(_) => (),
+                        Err(rm_err) => log::debug!("Can't remove part file: {:?}", rm_err),
+                    };
+                    last_err = Some(Box::new(err));
+                }
+            },
+            Err(err) => {
+                log::error!(
+                    "download attempt {} for {file_name} failed: {err}",
+                    attempt + 1
+                );
+                match tokio::fs::remove_file(&part_path).await {
+                    Ok(_) => (),
+                    Err(rm_err) => log::debug!("Can't remove part file: {:?}", rm_err),
+                };
+                last_err = Some(err);
+            }
+        }
+
+        if attempt + 1 < max_attempts {
+            let backoff_ms = 500u64 * 2u64.pow(attempt);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        Box::new(std::io::Error::other(format!(
+            "download failed for {file_name} after {max_attempts} attempts"
+        )))
+    }))
+}
+
+async fn download_file(
+    dest_dir: &Path,
+    file_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send>> {
+    let link = format!("{}/sql/{file_name}.gz", &config::CONFIG.fl_base_url);
+
+    download_file_with_client(
+        &HTTP_CLIENT,
+        &link,
+        dest_dir,
+        file_name,
+        Duration::from_secs(config::CONFIG.download_idle_timeout_secs),
+        config::CONFIG.download_max_attempts,
+    )
+    .await
 }
 
 async fn process<T>(
     pool: Pool,
     source_id: i16,
     file_name: &str,
+    deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
+) -> Result<(), Box<dyn std::error::Error + Send>>
+where
+    T: Debug + FromVecExpression<T> + Update,
+{
+    let data_dir = PathBuf::from(&config::CONFIG.data_dir);
+    let final_path = data_dir.join(file_name);
+
+    let result = process_inner::<T>(pool, source_id, file_name, &data_dir, &final_path, deps).await;
+
+    // Always clean up the decompressed dump after processing, regardless of
+    // whether processing succeeded or failed.
+    match tokio::fs::remove_file(&final_path).await {
+        Ok(_) => (),
+        Err(err) => log::debug!("Can't remove {}: {:?}", final_path.display(), err),
+    };
+
+    result
+}
+
+async fn process_inner<T>(
+    pool: Pool,
+    source_id: i16,
+    file_name: &str,
+    data_dir: &Path,
+    final_path: &Path,
     deps: Vec<tokio::sync::watch::Receiver<Option<UpdateStatus>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
@@ -96,7 +255,7 @@ where
 
     let start_time = std::time::Instant::now();
 
-    match download_file(file_name).await {
+    match download_file(data_dir, file_name).await {
         Ok(_) => (),
         Err(err) => return Err(err),
     };
@@ -106,7 +265,7 @@ where
         .arguments(SQLArguments::QuestionMark)
         .warn_unquoted_identifiers(true);
 
-    let lines = read_lines(file_name);
+    let lines = read_lines(final_path);
 
     let lines = match lines {
         Ok(v) => v,
@@ -129,10 +288,19 @@ where
 
     let mut upserted_count: u32 = 0;
 
+    let mut line_no: u64 = 0;
+
     for line in lines.into_iter() {
+        line_no += 1;
+
         let line = match line {
             Ok(line) => line,
-            Err(err) => return Err(Box::new(err)),
+            Err(err) => {
+                return Err(Box::new(std::io::Error::new(
+                    err.kind(),
+                    format!("{file_name}: invalid data at/after line {line_no}: {err}"),
+                )));
+            }
         };
 
         let mut issues = Issues::new(&line);
@@ -451,6 +619,18 @@ pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_update_inner() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Start update...");
 
+    match tokio::fs::create_dir_all(&config::CONFIG.data_dir).await {
+        Ok(_) => (),
+        Err(err) => {
+            log::error!(
+                "Can't create data dir {}: {:?}",
+                config::CONFIG.data_dir,
+                err
+            );
+            return Err(Box::new(err));
+        }
+    };
+
     let pool = match get_postgres_pool().await {
         Ok(pool) => pool,
         Err(err) => return Err(Box::new(err)),
@@ -659,4 +839,122 @@ pub async fn cron_jobs() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_compression::futures::bufread::GzipEncoder;
+    use axum::{body::Body, http::header, response::Response, routing::get, Router};
+    use futures::io::{AsyncReadExt, Cursor};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::TcpListener;
+
+    async fn spawn_server(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    }
+
+    async fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzipEncoder::new(Cursor::new(data));
+        let mut out = Vec::new();
+        encoder.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("lu_test_{name}_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_download_fails_and_cleans_up_on_truncated_content_length() {
+        let dir = temp_dir("truncated");
+        let file_name = "dump.sql";
+
+        let compressed = gzip_compress(b"hello world, some test payload for gzip").await;
+        let declared_len = compressed.len() as u64 + 1024;
+
+        let router = Router::new().route(
+            "/dump.sql.gz",
+            get(move || {
+                let compressed = compressed.clone();
+                async move {
+                    Response::builder()
+                        .header(header::CONTENT_LENGTH, declared_len)
+                        .body(Body::from_stream(futures::stream::once(async move {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from(compressed))
+                        })))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let base_url = spawn_server(router).await;
+        let url = format!("{base_url}/dump.sql.gz");
+
+        let client = reqwest::Client::new();
+        let result =
+            download_file_with_client(&client, &url, &dir, file_name, Duration::from_secs(5), 1)
+                .await;
+
+        assert!(result.is_err(), "expected truncated download to fail");
+
+        let final_path = dir.join(file_name);
+        let part_path = dir.join(format!("{file_name}.part"));
+        assert!(!final_path.exists(), "final file must not be left behind");
+        assert!(!part_path.exists(), "part file must be cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_download_fails_on_idle_timeout() {
+        let dir = temp_dir("idle");
+        let file_name = "dump.sql";
+
+        let router = Router::new().route(
+            "/dump.sql.gz",
+            get(|| async {
+                // Body that never yields any data, simulating a stalled connection.
+                Response::builder()
+                    .body(Body::from_stream(futures::stream::pending::<
+                        Result<bytes::Bytes, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        );
+
+        let base_url = spawn_server(router).await;
+        let url = format!("{base_url}/dump.sql.gz");
+
+        let client = reqwest::Client::new();
+        let idle = Duration::from_millis(200);
+
+        let start = std::time::Instant::now();
+        let result = download_file_with_client(&client, &url, &dir, file_name, idle, 1).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected stalled download to fail");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "download should fail quickly after idle timeout, took {elapsed:?}"
+        );
+
+        let final_path = dir.join(file_name);
+        let part_path = dir.join(format!("{file_name}.part"));
+        assert!(!final_path.exists(), "final file must not be left behind");
+        assert!(!part_path.exists(), "part file must be cleaned up");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

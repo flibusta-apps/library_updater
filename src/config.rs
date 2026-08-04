@@ -74,10 +74,22 @@ pub struct Config {
     pub fl_base_url: String,
 
     pub webhooks: Vec<Webhook>,
+
+    pub data_dir: String,
+    pub download_connect_timeout_secs: u64,
+    pub download_idle_timeout_secs: u64,
+    pub download_max_attempts: u32,
 }
 
 fn get_env(env: &'static str) -> String {
     std::env::var(env).unwrap_or_else(|_| panic!("Cannot get the {} env variable", env))
+}
+
+fn get_env_or<T: std::str::FromStr>(env: &'static str, default: T) -> T {
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Config {
@@ -102,6 +114,11 @@ impl Config {
                 .into_iter()
                 .map(build_webhook)
                 .collect(),
+
+            data_dir: get_env_or("DATA_DIR", "data".to_string()),
+            download_connect_timeout_secs: get_env_or("DOWNLOAD_CONNECT_TIMEOUT_SECS", 10),
+            download_idle_timeout_secs: get_env_or("DOWNLOAD_IDLE_TIMEOUT_SECS", 60),
+            download_max_attempts: get_env_or("DOWNLOAD_MAX_ATTEMPTS", 3),
         }
     }
 }

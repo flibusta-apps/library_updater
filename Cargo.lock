@@ -1667,6 +1667,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "deadpool-postgres",
  "dotenvy",
