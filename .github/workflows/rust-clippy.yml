@@ -41,7 +41,7 @@ jobs:
       - name: Install required cargo
         run: cargo install clippy-sarif sarif-fmt
 
-      - name: Run rust-clippy
+      - name: Run rust-clippy (SARIF report, non-blocking)
         run:
           cargo clippy
           --all-features
@@ -53,3 +53,6 @@ jobs:
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
+
+      - name: Run rust-clippy (blocking)
+        run: cargo clippy --all-features --all-targets -- -D warnings
