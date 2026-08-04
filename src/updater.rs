@@ -373,6 +373,19 @@ where
     (file_name, stage_file::<T>(pool, file_name).await)
 }
 
+/// Builds the deadpool-postgres pool used for all catalog-update DB access.
+///
+/// **Security posture (Spec 06.5):** the connection is made with `NoTls`.
+/// This is only acceptable when Postgres is reachable exclusively over a
+/// private/isolated network (e.g. a VPC-internal address, container
+/// network, or Unix socket) that an external attacker cannot reach or
+/// intercept traffic on - if that assumption doesn't hold for a given
+/// deployment, TLS must be enabled here instead. Separately, the Postgres
+/// role configured via `POSTGRES_USER`/`POSTGRES_PASSWORD` should be granted
+/// DML privileges only (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`COPY` on the
+/// catalog tables) and *not* `CREATE`/DDL rights: `crate::schema::ensure()`
+/// runs bootstrap DDL (table/function creation) and should be executed
+/// separately, as a migration step, using a distinct, more-privileged role.
 async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
     let mut config = Config::new();
 
@@ -864,24 +877,76 @@ lazy_static! {
     pub static ref RUN_STATE: RunState = RunState::new();
 }
 
-pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = match UPDATE_LOCK.try_lock() {
-        Ok(v) => v,
-        Err(err) => return Err(Box::new(err)),
-    };
-
+/// Runs one full update while holding `_lock` (the caller is required to
+/// have already acquired `UPDATE_LOCK`), recording start/end into
+/// `RUN_STATE`. Shared by both `update()` (used by `cron_jobs()`, which
+/// awaits the result directly) and `try_start_update()` (used by the
+/// `/update` HTTP handler, which spawns this as a background task) so the
+/// begin/run/end bookkeeping only lives in one place.
+async fn run_and_record(
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     RUN_STATE.begin_run();
     let result = run_update_inner().await;
     match &result {
         Ok(_) => RUN_STATE.end_run(true, "success".to_string()),
         Err(err) => RUN_STATE.end_run(false, err.to_string()),
     }
+    result
+}
+
+pub async fn update() -> Result<(), Box<dyn std::error::Error>> {
+    let lock = match UPDATE_LOCK.try_lock() {
+        Ok(v) => v,
+        Err(err) => return Err(Box::new(err)),
+    };
+
     // Widen `Box<dyn Error + Send + Sync>` (used internally so the update
     // future stays `Send` across the advisory-lock release await) to the
     // plain `Box<dyn Error>` of this function's public signature. A no-op
     // unsized coercion, not a lossy conversion - the source chain consumed
     // by `sentry::capture_error` in main.rs is unaffected.
-    result.map_err(|err| err as Box<dyn std::error::Error>)
+    run_and_record(lock)
+        .await
+        .map_err(|err| err as Box<dyn std::error::Error>)
+}
+
+/// Outcome of `try_start_update()`: whether an update run was actually
+/// (synchronously, before returning) confirmed to have started, or whether
+/// one was already in progress.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateStart {
+    /// `UPDATE_LOCK` was free; a background task has been spawned to run
+    /// the update.
+    Started,
+    /// `UPDATE_LOCK` was already held by another in-progress run; nothing
+    /// was started.
+    Busy,
+}
+
+/// Non-async, non-blocking entry point for the `/update` HTTP handler
+/// (Spec 06.4): attempts `UPDATE_LOCK.try_lock()` itself so the caller
+/// learns synchronously whether an update run actually started, without
+/// having to await any of the update's own async work. On success, spawns
+/// a task that takes ownership of the lock guard and runs
+/// `run_and_record()` (the same begin/run/end + result-logging/Sentry-
+/// capture behavior `update()`'s callers already rely on).
+pub fn try_start_update() -> UpdateStart {
+    match UPDATE_LOCK.try_lock() {
+        Ok(lock) => {
+            tokio::spawn(async move {
+                match run_and_record(lock).await {
+                    Ok(_) => log::info!("Updated!"),
+                    Err(err) => {
+                        log::error!("Updater err: {:?}", err);
+                        sentry::capture_error(err.as_ref());
+                    }
+                }
+            });
+            UpdateStart::Started
+        }
+        Err(_) => UpdateStart::Busy,
+    }
 }
 
 /// Postgres advisory lock key for the whole catalog-update run. A fixed,
@@ -1318,5 +1383,43 @@ mod tests {
         let (_stats, failures) = aggregate_stage_outcomes(outcomes);
 
         assert_eq!(failures.len(), 2);
+    }
+
+    // --- try_start_update ---
+    //
+    // These prove the Spec 06.4 lock semantics: the caller (the `/update`
+    // HTTP handler) must be able to tell, synchronously and without
+    // touching Postgres, whether an update run actually started or one was
+    // already in progress.
+
+    // These two cases share `UPDATE_LOCK` (global process state), so they
+    // run as a single test to avoid racing against each other if `cargo
+    // test` were to run them concurrently on separate threads.
+    #[tokio::test]
+    async fn try_start_update_reports_busy_then_started() {
+        {
+            // Hold the lock ourselves to simulate a run already in
+            // progress. `try_lock()` on the real `UPDATE_LOCK` fails purely
+            // based on mutex state, before any DB code runs, so this never
+            // touches Postgres.
+            let _guard = UPDATE_LOCK
+                .try_lock()
+                .expect("UPDATE_LOCK must be free at the start of this test");
+
+            assert_eq!(try_start_update(), UpdateStart::Busy);
+        }
+
+        // Lock released: `try_lock()` inside `try_start_update()` should
+        // now succeed and report `Started`, having spawned a background
+        // task. That spawned task's actual DB work will fail in this test
+        // environment (no `config::CONFIG`/Postgres available) - that's
+        // fine, only the synchronous return value is under test here (the
+        // DB-touching behavior is covered by other, integration-level
+        // tests).
+        assert_eq!(try_start_update(), UpdateStart::Started);
+
+        // Give the spawned task a moment to run (and release the lock)
+        // before this test function returns.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

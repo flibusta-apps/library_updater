@@ -1,4 +1,8 @@
-use axum::{http::HeaderMap, routing::post, Router};
+use axum::{
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Router,
+};
 use dotenvy::dotenv;
 use library_updater::{
     config,
@@ -64,29 +68,64 @@ update_webhook_errors_total {}\n",
     )
 }
 
-async fn update(headers: HeaderMap) -> &'static str {
-    let config_api_key = config::CONFIG.api_key.clone();
-
-    let api_key = match headers.get("Authorization") {
-        Some(v) => v,
-        None => return "No api-key!",
-    };
-
-    if config_api_key != api_key.to_str().unwrap() {
-        return "Wrong api-key!";
+/// Constant-time comparison of two byte slices (Spec 06.3): avoids leaking
+/// timing information about *where* the provided API key first differs
+/// from the configured one. Deliberately hand-rolled instead of pulling in
+/// the `subtle` crate, since this is the only place a constant-time compare
+/// is needed and the implementation is small and easy to audit: the loop
+/// always walks the full length of both slices (no early `return` on the
+/// first mismatching byte) and accumulates differences via bitwise OR
+/// rather than `==`/`!=`, so the number of loop iterations and branches
+/// taken is independent of where (or whether) the inputs differ. The one
+/// piece of information this does *not* hide is whether the lengths match
+/// (handled up front) - that only reveals the key's length, not its
+/// content, and the length check itself takes the same amount of time
+/// regardless of content.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
 
-    tokio::spawn(async {
-        match updater::update().await {
-            Ok(_) => log::info!("Updated!"),
-            Err(err) => {
-                log::error!("Updater err: {:?}", err);
-                sentry::capture_error(err.as_ref());
-            }
-        };
-    });
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
 
-    "Update started"
+    diff == 0
+}
+
+/// Checks the `Authorization` header against `expected_api_key` and, if it
+/// matches, attempts to start an update run. Split out from `update()` so
+/// tests can exercise the full auth + status-code logic (Spec 06.1/06.2)
+/// without requiring `config::CONFIG` (and therefore every env var it
+/// reads) to be initialized.
+async fn handle_update(headers: &HeaderMap, expected_api_key: &str) -> (StatusCode, &'static str) {
+    let api_key = match headers.get("Authorization") {
+        Some(v) => v,
+        None => return (StatusCode::UNAUTHORIZED, "No api-key!"),
+    };
+
+    // `HeaderValue::to_str()` errors on non-visible-ASCII bytes (Spec
+    // 06.1); a remote caller can send arbitrary bytes in this header
+    // without needing to know anything about the real key, so this must be
+    // handled as "unauthorized", not unwrapped/panicked on.
+    let api_key_str = match api_key.to_str() {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "Wrong api-key!"),
+    };
+
+    if !constant_time_eq(expected_api_key.as_bytes(), api_key_str.as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, "Wrong api-key!");
+    }
+
+    match updater::try_start_update() {
+        updater::UpdateStart::Started => (StatusCode::ACCEPTED, "Update started"),
+        updater::UpdateStart::Busy => (StatusCode::CONFLICT, "Update already running"),
+    }
+}
+
+async fn update(headers: HeaderMap) -> (StatusCode, &'static str) {
+    handle_update(&headers, &config::CONFIG.api_key).await
 }
 
 async fn start_app() {
@@ -144,4 +183,58 @@ async fn main() {
     };
 
     tokio::join![cron_task, start_app()];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    const TEST_KEY: &str = "correct-horse-battery-staple";
+
+    #[test]
+    fn constant_time_eq_matches_equal_slices() {
+        assert!(constant_time_eq(b"same", b"same"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_content_same_length() {
+        assert!(!constant_time_eq(b"aaaa", b"aaab"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_length() {
+        assert!(!constant_time_eq(b"short", b"much longer value"));
+    }
+
+    #[tokio::test]
+    async fn update_missing_header_returns_401() {
+        let headers = HeaderMap::new();
+        let (status, _) = handle_update(&headers, TEST_KEY).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn update_invalid_header_bytes_return_401_without_panicking() {
+        let mut headers = HeaderMap::new();
+        // `HeaderValue::from_bytes` accepts non-UTF8/non-ASCII opaque bytes;
+        // `to_str()` on it fails. This must not panic the handler (Spec
+        // 06.1), and must be treated as unauthorized (Spec 06.2).
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_bytes(&[0xFF, 0xFE, 0xFD]).unwrap(),
+        );
+
+        let (status, _) = handle_update(&headers, TEST_KEY).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn update_wrong_key_returns_401() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", HeaderValue::from_static("wrong-key"));
+
+        let (status, _) = handle_update(&headers, TEST_KEY).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
 }
