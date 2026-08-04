@@ -90,6 +90,15 @@ pub struct Config {
     /// `stage_file` tasks (each holding a connection for the whole file)
     /// onto far fewer real connections than intended.
     pub postgres_max_pool_size: usize,
+    /// How long (seconds) a pool checkout will wait for a free connection
+    /// before giving up, set explicitly on the deadpool-postgres pool
+    /// config rather than relying on deadpool's default (unbounded) wait.
+    /// After Spec 14.1's one-pooled-client-per-`stage_file`-task model, a
+    /// saturated pool (e.g. `postgres_max_pool_size` too small for the
+    /// concurrent Phase A file tasks) should fail loudly and quickly rather
+    /// than queue checkouts silently, which would otherwise look like a
+    /// stall rather than a config problem.
+    pub postgres_pool_wait_timeout_secs: u64,
     /// Minimum ratio of (rows staged this run) / (non-deleted rows currently
     /// in the DB for this source) required to proceed to the merge
     /// transaction. Guards against a truncated/partial upstream dump
@@ -164,6 +173,7 @@ impl Config {
                 "ru,be,uk".to_string(),
             )),
             postgres_max_pool_size: get_env_or("POSTGRES_MAX_POOL_SIZE", 16),
+            postgres_pool_wait_timeout_secs: get_env_or("POSTGRES_POOL_WAIT_TIMEOUT_SECS", 10),
             min_staging_ratio: get_env_or("MIN_STAGING_RATIO", 0.5),
             merge_work_mem: get_env_or("MERGE_WORK_MEM", "256MB".to_string()),
         }

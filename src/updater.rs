@@ -283,6 +283,25 @@ pub fn parse_insert_values(line: &str) -> Vec<Vec<Expression<'_>>> {
     }
 }
 
+/// One parsed-and-converted outcome flowing from the blocking parse worker
+/// to the async COPY writer in `stage_file_inner`. `Row` carries data ready
+/// to bind to the COPY sink; `Skipped` carries a human-readable reason for
+/// a row that failed to parse or convert (bounded logging, see 14.4).
+enum ParsedItem {
+    Row(Vec<crate::types::Val>),
+    Skipped(String),
+}
+
+/// Bounded channel capacity between the blocking parse worker and the async
+/// COPY writer in `stage_file_inner`: gives backpressure so parsed rows
+/// don't pile up in RAM ahead of a slow writer (Spec 14.2).
+const PARSE_CHANNEL_CAPACITY: usize = 1024;
+
+/// Cap on how many per-row skip failures get logged at ERROR (with detail)
+/// per file; beyond this, only a final count is logged (Spec 14.4 — avoids
+/// unbounded multi-KB log lines on a systematically bad dump).
+const MAX_LOGGED_SKIPS_PER_FILE: u64 = 20;
+
 async fn stage_file_inner<T>(
     pool: Pool,
     file_name: &str,
@@ -312,39 +331,90 @@ where
 
     log::info!("Start staging {file_name}...");
 
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ParsedItem>(PARSE_CHANNEL_CAPACITY);
+
+    let producer_file_name = file_name.to_string();
+    let producer_handle = tokio::task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let file_name = producer_file_name;
+
+            for (line_no, line) in (1_u64..).zip(lines) {
+                let line = line.map_err(|err| {
+                    Box::new(std::io::Error::new(
+                        err.kind(),
+                        format!("{file_name}: invalid data at/after line {line_no}: {err}"),
+                    )) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+
+                for t_value in parse_insert_values(&line) {
+                    let value = match T::from_vec_expression(&t_value) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            if tx
+                                .blocking_send(ParsedItem::Skipped(format!("{:?}", e)))
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    };
+
+                    let row = match value.to_row() {
+                        Ok(row) => row,
+                        Err(e) => {
+                            if tx
+                                .blocking_send(ParsedItem::Skipped(format!("{:?}", e)))
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    };
+
+                    if tx.blocking_send(ParsedItem::Row(row)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            Ok(())
+        },
+    );
+
     let mut skipped: u64 = 0;
+    let mut logged: u64 = 0;
 
-    for (line_no, line) in (1_u64..).zip(lines) {
-        let line = line.map_err(|err| {
-            Box::new(std::io::Error::new(
-                err.kind(),
-                format!("{file_name}: invalid data at/after line {line_no}: {err}"),
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
+    while let Some(item) = rx.recv().await {
+        match item {
+            ParsedItem::Row(row) => {
+                let params: Vec<&(dyn ToSql + Sync)> =
+                    row.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
 
-        for t_value in parse_insert_values(&line) {
-            let value = match T::from_vec_expression(&t_value) {
-                Ok(value) => value,
-                Err(e) => {
-                    log::error!("Parse error in {file_name}: {:?}", e);
-                    skipped += 1;
-                    continue;
+                writer.as_mut().write(&params).await?;
+            }
+            ParsedItem::Skipped(detail) => {
+                skipped += 1;
+                if logged < MAX_LOGGED_SKIPS_PER_FILE {
+                    log::error!("Parse error in {file_name}: {detail}");
+                    logged += 1;
                 }
-            };
+            }
+        }
+    }
 
-            let row = match value.to_row() {
-                Ok(row) => row,
-                Err(e) => {
-                    log::error!("Row conversion error in {file_name}: {:?}", e);
-                    skipped += 1;
-                    continue;
-                }
-            };
+    if skipped > logged {
+        log::error!(
+            "{file_name}: ... and {} more skipped rows",
+            skipped - logged
+        );
+    }
 
-            let params: Vec<&(dyn ToSql + Sync)> =
-                row.iter().map(|v| v as &(dyn ToSql + Sync)).collect();
-
-            writer.as_mut().write(&params).await?;
+    match producer_handle.await {
+        Ok(result) => result?,
+        Err(join_err) => {
+            return Err(Box::new(std::io::Error::other(join_err.to_string())));
         }
     }
 
@@ -398,9 +468,11 @@ async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
     config.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
-    config.pool = Some(deadpool_postgres::PoolConfig::new(
-        config::CONFIG.postgres_max_pool_size,
+    let mut pool_config = deadpool_postgres::PoolConfig::new(config::CONFIG.postgres_max_pool_size);
+    pool_config.timeouts.wait = Some(std::time::Duration::from_secs(
+        config::CONFIG.postgres_pool_wait_timeout_secs,
     ));
+    config.pool = Some(pool_config);
 
     match config.create_pool(Some(Runtime::Tokio1), NoTls) {
         Ok(pool) => Ok(pool),

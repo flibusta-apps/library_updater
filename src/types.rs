@@ -135,7 +135,7 @@ impl FromVecExpression<Author> for Author {
             }
         };
         let last_name = match &value[3] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Author",
@@ -145,7 +145,7 @@ impl FromVecExpression<Author> for Author {
             }
         };
         let first_name = match &value[1] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Author",
@@ -155,7 +155,7 @@ impl FromVecExpression<Author> for Author {
             }
         };
         let middle_name = match &value[2] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Author",
@@ -219,7 +219,7 @@ impl FromVecExpression<Book> for Book {
             }
         };
         let title = match &value[3] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Book",
@@ -239,7 +239,7 @@ impl FromVecExpression<Book> for Book {
             }
         };
         let file_type = match &value[8] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Book",
@@ -482,7 +482,7 @@ impl FromVecExpression<Sequence> for Sequence {
             }
         };
         let name = match &value[1] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value),
+            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Sequence",
@@ -612,7 +612,7 @@ impl FromVecExpression<BookAnnotation> for BookAnnotation {
             }
         };
         let title = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "BookAnnotation",
@@ -678,7 +678,7 @@ impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
             }
         };
         let file = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "BookAnnotationPic",
@@ -726,7 +726,7 @@ impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
             }
         };
         let title = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "AuthorAnnotation",
@@ -792,7 +792,7 @@ impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
             }
         };
         let file = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "AuthorAnnotationPic",
@@ -841,7 +841,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let code = match &value[1] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",
@@ -851,7 +851,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let description = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",
@@ -861,7 +861,7 @@ impl FromVecExpression<Genre> for Genre {
             }
         };
         let meta = match &value[3] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value),
+            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
             other => {
                 return Err(ParseError {
                     type_name: "Genre",

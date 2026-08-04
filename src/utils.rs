@@ -1,19 +1,23 @@
 use ammonia::Builder;
 use maplit::hashset;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-/// Reads `filename` line by line. Each line is buffered fully in memory
-/// (acceptable for current dump sizes, but note multi-megabyte lines are
-/// held entirely in RAM); invalid UTF-8 anywhere in the file surfaces as an
-/// `io::Error` when the corresponding item in the returned iterator is read.
+/// Reads `filename` line by line, using a 1 MiB read buffer (Flibusta dump
+/// lines can be multi-megabyte `INSERT` statements, so the default 8 KiB
+/// `BufReader` buffer would otherwise cause excessive re-fill syscalls).
+/// Each line is still buffered fully in memory (acceptable for current dump
+/// sizes, but note multi-megabyte lines are held entirely in RAM); invalid
+/// UTF-8 anywhere in the file surfaces as an `io::Error` when the
+/// corresponding item in the returned iterator is read.
 pub fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where
     P: AsRef<Path>,
 {
     let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
+    Ok(io::BufReader::with_capacity(1024 * 1024, file).lines())
 }
 
 /// Unescape a MySQL/MariaDB string literal (as produced by dump `INSERT`
@@ -31,7 +35,11 @@ where
 /// documented behavior ("For all other escape sequences, backslash is
 /// ignored"). A trailing, unpaired backslash at the end of the string is
 /// kept as a literal backslash.
-pub fn unescape_mysql_string(s: &str) -> String {
+pub fn unescape_mysql_string(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
+
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
 
@@ -60,7 +68,7 @@ pub fn unescape_mysql_string(s: &str) -> String {
         }
     }
 
-    result
+    Cow::Owned(result)
 }
 
 /// Clean up a name-like field (author name, book title, sequence name)
@@ -73,8 +81,13 @@ pub fn unescape_mysql_string(s: &str) -> String {
 /// unescaping. Search-time normalization (e.g. `ё`→`е` folding for typo
 /// tolerance) belongs in the search-indexing service (Meilisearch), not
 /// in the canonical Postgres store.
-pub fn remove_wrong_chars(s: &str) -> String {
-    unescape_mysql_string(s).replace('\n', " ")
+pub fn remove_wrong_chars(s: &str) -> Cow<'_, str> {
+    let unescaped = unescape_mysql_string(s);
+    if unescaped.contains('\n') {
+        Cow::Owned(unescaped.replace('\n', " "))
+    } else {
+        unescaped
+    }
 }
 
 /// Normalize a BCP-47-ish language tag from a dump to its primary
@@ -111,6 +124,7 @@ mod tests {
     use crate::utils::{
         fix_annotation_text, parse_lang, remove_wrong_chars, unescape_mysql_string,
     };
+    use std::borrow::Cow;
 
     // --- unescape_mysql_string ---
 
@@ -208,6 +222,70 @@ mod tests {
     fn remove_wrong_chars_unescapes_quotes() {
         assert_eq!(remove_wrong_chars("O\\'Brien"), "O'Brien");
         assert_eq!(remove_wrong_chars("say \\\"hi\\\""), "say \"hi\"");
+    }
+
+    // --- corpus / allocation-strategy regression guard (Spec 14.3) ---
+
+    #[test]
+    fn unescape_and_remove_wrong_chars_corpus() {
+        // (input, expected unescape_mysql_string output, expected remove_wrong_chars output)
+        let cases: &[(&str, &str, &str)] = &[
+            ("", "", ""),
+            ("hello world", "hello world", "hello world"),
+            ("a\\\"b", "a\"b", "a\"b"),
+            ("a\\'b", "a'b", "a'b"),
+            ("a\\0b", "a\0b", "a\0b"),
+            ("a\\bb", "a\u{8}b", "a\u{8}b"),
+            ("a\\nb", "a\nb", "a b"),
+            ("a\\rb", "a\rb", "a\rb"),
+            ("a\\tb", "a\tb", "a\tb"),
+            ("a\\Zb", "a\u{1a}b", "a\u{1a}b"),
+            ("a\\\\b", "a\\b", "a\\b"),
+            ("a\\%b", "a\\%b", "a\\%b"),
+            ("a\\_b", "a\\_b", "a\\_b"),
+            ("a\\xb", "axb", "axb"),
+            ("a\\", "a\\", "a\\"),
+            ("Foo\nBar", "Foo\nBar", "Foo Bar"),
+            ("a\\n\\tb\nc", "a\n\tb\nc", "a \tb c"),
+            (
+                "Ёжик в тумане; ёлка",
+                "Ёжик в тумане; ёлка",
+                "Ёжик в тумане; ёлка",
+            ),
+            ("\\n\\t\\\"\\'", "\n\t\"'", " \t\"'"),
+        ];
+
+        for (input, expected_unescape, expected_remove) in cases {
+            assert_eq!(
+                unescape_mysql_string(input),
+                *expected_unescape,
+                "unescape_mysql_string mismatch for input {input:?}"
+            );
+            assert_eq!(
+                remove_wrong_chars(input),
+                *expected_remove,
+                "remove_wrong_chars mismatch for input {input:?}"
+            );
+        }
+
+        // Fast-path (no backslash, no literal newline) inputs must be
+        // zero-allocation: Cow::Borrowed all the way through.
+        let clean_inputs: &[&str] = &[
+            "",
+            "hello world",
+            "Ёжик в тумане; ёлка",
+            "plain ascii text with no escapes",
+        ];
+        for input in clean_inputs {
+            assert!(
+                matches!(unescape_mysql_string(input), Cow::Borrowed(_)),
+                "expected Cow::Borrowed for unescape_mysql_string({input:?})"
+            );
+            assert!(
+                matches!(remove_wrong_chars(input), Cow::Borrowed(_)),
+                "expected Cow::Borrowed for remove_wrong_chars({input:?})"
+            );
+        }
     }
 
     // --- parse_lang ---
