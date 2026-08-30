@@ -104,8 +104,41 @@ pub fn parse_lang(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Collapse literal `\r\n`, `\r`, `\n`, `\t` two-character sequences that
+/// survive `unescape_mysql_string` unchanged.
+///
+/// After `unescape_mysql_string` runs, a backslash can only remain in the
+/// output in three cases: an escaped literal backslash (`\\` -> `\`),
+/// `\%`/`\_` (kept intact, MySQL `LIKE`-pattern escapes), or a trailing
+/// unpaired backslash at the very end of the string. Every other
+/// `\<char>` sequence has its backslash consumed and dropped during that
+/// pass. So if `\r`, `\n`, or `\t` (backslash immediately followed by one
+/// of those letters) is still present afterward, it cannot be a
+/// mis-handled single escape - it can only be what's left of a *doubly*
+/// escaped backslash (dump literal `\\r` -> one unescape pass -> literal
+/// `\r`) coming from an upstream source that escaped its own already-escaped
+/// text a second time before generating the dump. Folding these to real
+/// whitespace trades away the vanishingly rare case of an annotation
+/// intentionally discussing the two-character sequence "\r"/"\n"/"\t" as
+/// prose, in exchange for fixing what is otherwise visibly broken text for
+/// every annotation from that source.
+fn collapse_double_escaped_whitespace(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
+
+    let fixed = s
+        .replace("\\r\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t");
+
+    Cow::Owned(fixed)
+}
+
 pub fn fix_annotation_text(text: &str) -> String {
     let unescaped = unescape_mysql_string(text);
+    let unescaped = collapse_double_escaped_whitespace(&unescaped);
     let mut temp_text = unescaped
         .replace("<br>", "\n")
         .replace("&nbsp;", " ")
@@ -122,7 +155,8 @@ pub fn fix_annotation_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::utils::{
-        fix_annotation_text, parse_lang, remove_wrong_chars, unescape_mysql_string,
+        collapse_double_escaped_whitespace, fix_annotation_text, parse_lang, remove_wrong_chars,
+        unescape_mysql_string,
     };
     use std::borrow::Cow;
 
@@ -370,6 +404,47 @@ mod tests {
         let result = fix_annotation_text(input);
 
         assert_eq!(result, expected_result);
+    }
+
+    #[test]
+    fn fix_annotation_text_collapses_double_escaped_crlf() {
+        // Dump literal contains `\\r\\n` (doubled backslashes); one MySQL
+        // unescape pass correctly yields the literal text `\r\n`, which
+        // must then be folded to a real newline.
+        let input = "Line1\\\\r\\\\nLine2";
+        assert_eq!(fix_annotation_text(input), "Line1\nLine2");
+    }
+
+    #[test]
+    fn fix_annotation_text_collapses_double_escaped_lone_r() {
+        let input = "a\\\\rb";
+        assert_eq!(fix_annotation_text(input), "a\nb");
+    }
+
+    #[test]
+    fn fix_annotation_text_collapses_double_escaped_tab() {
+        let input = "a\\\\tb";
+        assert_eq!(fix_annotation_text(input), "a\tb");
+    }
+
+    #[test]
+    fn fix_annotation_text_single_escaped_crlf_still_works() {
+        // Regression guard: a normally single-escaped `\r\n` must still
+        // become a real newline exactly as before this change.
+        let input = "Line1\\r\\nLine2";
+        assert_eq!(fix_annotation_text(input), "Line1\nLine2");
+    }
+
+    #[test]
+    fn collapse_double_escaped_whitespace_leaves_plain_text_unchanged() {
+        assert_eq!(
+            collapse_double_escaped_whitespace("hello world"),
+            "hello world"
+        );
+        assert!(matches!(
+            collapse_double_escaped_whitespace("hello world"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
