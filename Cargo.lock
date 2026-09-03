@@ -2934,9 +2934,9 @@ dependencies = [
 
 [[package]]
 name = "sql-parse"
-version = "0.26.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3da66e13f9674d8747874c9af828949bdcbe8b8204975fa4d44894cff928d211"
+checksum = "b6f4dd54e1ba968a9dc77d3d04bc343185c400f1c1917b2347e9f93a95fc4396"
 
 [[package]]
 name = "stable_deref_trait"
