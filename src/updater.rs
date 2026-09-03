@@ -764,7 +764,7 @@ async fn load_and_merge_transaction(
     let tx = client.transaction().await?;
 
     tx.batch_execute(&format!(
-        "SET LOCAL statement_timeout = '30min'; SET LOCAL lock_timeout = '30s'; SET LOCAL work_mem = '{}';",
+        "SET LOCAL statement_timeout = '30min'; SET LOCAL lock_timeout = '30s'; SET LOCAL work_mem = '{}'; SET LOCAL max_parallel_workers_per_gather = 0;",
         config::CONFIG.merge_work_mem
     ))
     .await?;
