@@ -195,7 +195,7 @@ async fn download_file(
     dest_dir: &Path,
     file_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let link = format!("{}/sql/{file_name}.gz", &config::CONFIG.fl_base_url);
+    let link = format!("{}/sql/{file_name}.gz", config::CONFIG.fl_base_url);
 
     download_file_with_client(
         &HTTP_CLIENT,

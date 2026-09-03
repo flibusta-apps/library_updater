@@ -551,7 +551,7 @@ impl FromVecExpression<SequenceInfo> for SequenceInfo {
                     return Err(ParseError {
                         type_name: "SequenceInfo",
                         field: "position",
-                        detail: format!("{:?}", &value[2]),
+                        detail: format!("{:?}", value[2]),
                     })
                 }
             },
