@@ -79,6 +79,10 @@ pub struct Config {
     pub download_connect_timeout_secs: u64,
     pub download_idle_timeout_secs: u64,
     pub download_max_attempts: u32,
+    /// Hard per-file deadline (seconds) covering all download attempts of a
+    /// single dump file, so a server that never answers can't hang a run
+    /// (and the locks it holds) forever.
+    pub download_total_timeout_secs: u64,
 
     /// Languages considered "kept" (non-deleted) for books; anything else is
     /// soft-deleted at merge time. Comma-separated, lowercased, trimmed.
@@ -105,6 +109,9 @@ pub struct Config {
     /// silently soft-deleting the whole catalog via the anti-join delete
     /// steps. Skipped when the DB-side count is 0 (first run for a source).
     pub min_staging_ratio: f64,
+    /// Maximum tolerated ratio `skipped / (staged + skipped)` per dump file.
+    /// Above it the run fails before the merge transaction.
+    pub max_skipped_ratio: f64,
     /// `work_mem` used for the Phase B merge transaction (`SET LOCAL
     /// work_mem = ...`). The merge plan does several hash joins/aggregates
     /// over the staging tables, so a larger-than-default work_mem avoids
@@ -133,17 +140,57 @@ fn get_env(env: &'static str) -> String {
     std::env::var(env).unwrap_or_else(|_| panic!("Cannot get the {} env variable", env))
 }
 
-fn get_env_or<T: std::str::FromStr>(env: &'static str, default: T) -> T {
-    std::env::var(env)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Reads and parses an optional env variable. Unset -> `default`; set but
+/// unparsable -> panic at startup (no silent fallback to the default).
+fn get_env_or<T>(env: &'static str, default: T) -> T
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(env) {
+        Err(_) => default,
+        Ok(v) => v
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("Invalid {env} env variable ({v:?}): {e}")),
+    }
+}
+
+fn require_positive(env: &'static str, v: u64) -> u64 {
+    if v == 0 {
+        panic!("{env} must be greater than 0");
+    }
+    v
+}
+
+fn parse_api_key(raw: String) -> String {
+    if raw.trim().is_empty() {
+        panic!("API_KEY env variable must not be empty");
+    }
+    raw
+}
+
+/// `MIN_STAGING_RATIO` must be finite and in (0, 1]: 0 (or negative) would
+/// disable the truncated-dump guard entirely.
+fn validate_min_staging_ratio(v: f64) -> f64 {
+    if !v.is_finite() || v <= 0.0 || v > 1.0 {
+        panic!("MIN_STAGING_RATIO must be a finite number in (0, 1], got {v}");
+    }
+    v
+}
+
+/// `MAX_SKIPPED_RATIO` must be finite and in [0, 1].
+fn validate_max_skipped_ratio(v: f64) -> f64 {
+    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        panic!("MAX_SKIPPED_RATIO must be a finite number in [0, 1], got {v}");
+    }
+    v
 }
 
 impl Config {
     pub fn load() -> Config {
         Config {
-            api_key: get_env("API_KEY"),
+            api_key: parse_api_key(get_env("API_KEY")),
 
             sentry_dsn: get_env("SENTRY_DSN"),
 
@@ -164,19 +211,87 @@ impl Config {
                 .collect(),
 
             data_dir: get_env_or("DATA_DIR", "data".to_string()),
-            download_connect_timeout_secs: get_env_or("DOWNLOAD_CONNECT_TIMEOUT_SECS", 10),
-            download_idle_timeout_secs: get_env_or("DOWNLOAD_IDLE_TIMEOUT_SECS", 60),
-            download_max_attempts: get_env_or("DOWNLOAD_MAX_ATTEMPTS", 3),
+            download_connect_timeout_secs: require_positive(
+                "DOWNLOAD_CONNECT_TIMEOUT_SECS",
+                get_env_or("DOWNLOAD_CONNECT_TIMEOUT_SECS", 10),
+            ),
+            download_idle_timeout_secs: require_positive(
+                "DOWNLOAD_IDLE_TIMEOUT_SECS",
+                get_env_or("DOWNLOAD_IDLE_TIMEOUT_SECS", 60),
+            ),
+            download_max_attempts: require_positive(
+                "DOWNLOAD_MAX_ATTEMPTS",
+                get_env_or("DOWNLOAD_MAX_ATTEMPTS", 3u64),
+            ) as u32,
+            download_total_timeout_secs: require_positive(
+                "DOWNLOAD_TOTAL_TIMEOUT_SECS",
+                get_env_or("DOWNLOAD_TOTAL_TIMEOUT_SECS", 1800),
+            ),
 
             allowed_langs: parse_allowed_langs(&get_env_or(
                 "ALLOWED_LANGS",
                 "ru,be,uk".to_string(),
             )),
-            postgres_max_pool_size: get_env_or("POSTGRES_MAX_POOL_SIZE", 16),
-            postgres_pool_wait_timeout_secs: get_env_or("POSTGRES_POOL_WAIT_TIMEOUT_SECS", 10),
-            min_staging_ratio: get_env_or("MIN_STAGING_RATIO", 0.5),
+            postgres_max_pool_size: require_positive(
+                "POSTGRES_MAX_POOL_SIZE",
+                get_env_or("POSTGRES_MAX_POOL_SIZE", 16u64),
+            ) as usize,
+            postgres_pool_wait_timeout_secs: require_positive(
+                "POSTGRES_POOL_WAIT_TIMEOUT_SECS",
+                get_env_or("POSTGRES_POOL_WAIT_TIMEOUT_SECS", 10),
+            ),
+            min_staging_ratio: validate_min_staging_ratio(get_env_or("MIN_STAGING_RATIO", 0.5)),
+            max_skipped_ratio: validate_max_skipped_ratio(get_env_or("MAX_SKIPPED_RATIO", 0.01)),
             merge_work_mem: get_env_or("MERGE_WORK_MEM", "256MB".to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "API_KEY")]
+    fn empty_api_key_is_rejected() {
+        parse_api_key("   ".to_string());
+    }
+
+    #[test]
+    fn min_staging_ratio_accepts_valid_values() {
+        assert_eq!(validate_min_staging_ratio(0.5), 0.5);
+        assert_eq!(validate_min_staging_ratio(1.0), 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "MIN_STAGING_RATIO")]
+    fn min_staging_ratio_rejects_zero() {
+        validate_min_staging_ratio(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "MIN_STAGING_RATIO")]
+    fn min_staging_ratio_rejects_nan() {
+        validate_min_staging_ratio(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "MIN_STAGING_RATIO")]
+    fn min_staging_ratio_rejects_above_one() {
+        validate_min_staging_ratio(1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_SKIPPED_RATIO")]
+    fn max_skipped_ratio_rejects_negative() {
+        validate_max_skipped_ratio(-0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid CFG_TEST_UNPARSABLE")]
+    fn unparsable_numeric_env_fails() {
+        std::env::set_var("CFG_TEST_UNPARSABLE", "abc");
+        let _: u64 = get_env_or("CFG_TEST_UNPARSABLE", 5);
     }
 }
 
