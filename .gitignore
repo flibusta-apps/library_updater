@@ -1,3 +1,5 @@
 /target
 /.vscode
 /bruno
+.env*
+!.env.example

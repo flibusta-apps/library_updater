@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use chrono::{NaiveDate, NaiveDateTime};
 use sql_parse::Expression;
 use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
@@ -28,16 +30,154 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Per-thread counters of "soft" data fixes applied while converting rows
+/// (truncations, sentinel dates). A dump file is parsed on a single blocking
+/// thread, so the producer reads them once per file with
+/// [`take_row_counters`] and logs a summary instead of one line per row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RowCounters {
+    /// Text values truncated to the target column length.
+    pub truncated: u64,
+    /// `0000-00-00 ...` dates replaced by the sentinel date.
+    pub zero_dates: u64,
+    /// Other unparseable dates replaced by the sentinel date.
+    pub bad_dates: u64,
+}
+
+thread_local! {
+    static ROW_COUNTERS: Cell<RowCounters> = const { Cell::new(RowCounters { truncated: 0, zero_dates: 0, bad_dates: 0 }) };
+}
+
+/// Max number of per-row warnings (per thread/file) before only counting.
+const MAX_ROW_WARNINGS: u64 = 20;
+
+fn bump(f: impl FnOnce(&mut RowCounters)) -> RowCounters {
+    ROW_COUNTERS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+        v
+    })
+}
+
+/// Returns and resets this thread's counters.
+pub fn take_row_counters() -> RowCounters {
+    ROW_COUNTERS.with(|c| c.replace(RowCounters::default()))
+}
+
+/// Get column `i` of a row or a `ParseError` (never panics on short rows).
+fn get<'v, 'a>(
+    value: &'v [Expression<'a>],
+    i: usize,
+    type_name: &'static str,
+    field: &'static str,
+) -> Result<&'v Expression<'a>, ParseError> {
+    value.get(i).ok_or_else(|| ParseError {
+        type_name,
+        field,
+        detail: format!(
+            "row has {} column(s), column index {} is required",
+            value.len(),
+            i
+        ),
+    })
+}
+
+fn unexpected(type_name: &'static str, field: &'static str, other: &Expression) -> ParseError {
+    ParseError {
+        type_name,
+        field,
+        detail: format!("unexpected value {:?}", other),
+    }
+}
+
+fn get_int(
+    value: &[Expression],
+    i: usize,
+    type_name: &'static str,
+    field: &'static str,
+) -> Result<u64, ParseError> {
+    match get(value, i, type_name, field)? {
+        Expression::Integer(v) => Ok(v.0),
+        other => Err(unexpected(type_name, field, other)),
+    }
+}
+
+fn get_str<'v>(
+    value: &'v [Expression],
+    i: usize,
+    type_name: &'static str,
+    field: &'static str,
+) -> Result<&'v str, ParseError> {
+    match get(value, i, type_name, field)? {
+        Expression::String(v) => Ok(v.value.as_ref()),
+        other => Err(unexpected(type_name, field, other)),
+    }
+}
+
+fn get_opt_str<'v>(
+    value: &'v [Expression],
+    i: usize,
+    type_name: &'static str,
+    field: &'static str,
+) -> Result<Option<&'v str>, ParseError> {
+    match get(value, i, type_name, field)? {
+        Expression::String(v) => Ok(Some(v.value.as_ref())),
+        Expression::Null(_) => Ok(None),
+        other => Err(unexpected(type_name, field, other)),
+    }
+}
+
+/// Removes NUL characters (rejected by Postgres `text`) and, if `max_chars`
+/// is given, truncates to that many *characters* (matching `VARCHAR(n)`
+/// semantics), counting and warning about each truncation.
+fn clean_text(
+    s: &str,
+    max_chars: Option<usize>,
+    type_name: &'static str,
+    field: &'static str,
+    id: u64,
+) -> String {
+    let mut out = if s.contains('\0') {
+        s.replace('\0', "")
+    } else {
+        s.to_owned()
+    };
+
+    if let Some(max) = max_chars {
+        if let Some((idx, _)) = out.char_indices().nth(max) {
+            let total_chars = out.chars().count();
+            out.truncate(idx);
+            let counters = bump(|c| c.truncated += 1);
+            if counters.truncated <= MAX_ROW_WARNINGS {
+                log::warn!(
+                    "{type_name}(id={id}).{field}: value of {total_chars} chars truncated to {max}"
+                );
+            }
+        }
+    }
+
+    out
+}
+
 /// Parse a Flibusta `Time` string into a `NaiveDate`.
 ///
-/// Falls back to a sentinel date (`1970-01-01`) with a logged warning if the
-/// value doesn't match the expected format (known Flibusta oddities include
-/// `0000-00-00 00:00:00` and date-only values).
+/// Falls back to a sentinel date (`1970-01-01`) if the value doesn't match
+/// the expected format. `0000-00-00 ...` (a known Flibusta oddity) is only
+/// counted (see [`RowCounters::zero_dates`]); any other unparseable value is
+/// counted and warned about (bounded).
 fn parse_book_date(s: &str) -> NaiveDate {
     match NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         Ok(dt) => dt.date(),
         Err(_) => {
-            log::warn!("Book.uploaded: unparseable date {:?}, using sentinel", s);
+            if s.starts_with("0000-00-00") {
+                bump(|c| c.zero_dates += 1);
+            } else {
+                let counters = bump(|c| c.bad_dates += 1);
+                if counters.bad_dates <= MAX_ROW_WARNINGS {
+                    log::warn!("Book.uploaded: unparseable date {:?}, using sentinel", s);
+                }
+            }
             NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
         }
     }
@@ -114,6 +254,36 @@ fn conv_i16(v: u64, type_name: &'static str, field: &'static str) -> Result<i16,
     })
 }
 
+// Target column lengths, see book_library_server/migrations.
+const AUTHOR_NAME_MAX: usize = 256;
+const BOOK_TITLE_MAX: usize = 256;
+const BOOK_LANG_MAX: usize = 3;
+const BOOK_FILE_TYPE_MAX: usize = 4;
+const SEQUENCE_NAME_MAX: usize = 256;
+const ANNOTATION_TITLE_MAX: usize = 256;
+const ANNOTATION_FILE_MAX: usize = 256;
+const GENRE_CODE_MAX: usize = 45;
+const GENRE_DESCRIPTION_MAX: usize = 99;
+const GENRE_META_MAX: usize = 45;
+
+/// Rejects (-> row skipped) a value that doesn't fit a short code column.
+fn check_len(
+    s: String,
+    max: usize,
+    type_name: &'static str,
+    field: &'static str,
+) -> Result<String, ParseError> {
+    let len = s.chars().count();
+    if len > max {
+        return Err(ParseError {
+            type_name,
+            field,
+            detail: format!("value {s:?} has {len} chars, column allows {max}"),
+        });
+    }
+    Ok(s)
+}
+
 #[derive(Debug)]
 pub struct Author {
     pub id: u64,
@@ -124,46 +294,29 @@ pub struct Author {
 
 impl FromVecExpression<Author> for Author {
     fn from_vec_expression(value: &[Expression]) -> Result<Author, ParseError> {
-        let id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Author",
-                    field: "id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let last_name = match &value[3] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Author",
-                    field: "last_name",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let first_name = match &value[1] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Author",
-                    field: "first_name",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let middle_name = match &value[2] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Author",
-                    field: "middle_name",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "Author";
+        let id = get_int(value, 0, T, "id")?;
+        let last_name = clean_text(
+            &remove_wrong_chars(get_str(value, 3, T, "last_name")?),
+            Some(AUTHOR_NAME_MAX),
+            T,
+            "last_name",
+            id,
+        );
+        let first_name = clean_text(
+            &remove_wrong_chars(get_str(value, 1, T, "first_name")?),
+            Some(AUTHOR_NAME_MAX),
+            T,
+            "first_name",
+            id,
+        );
+        let middle_name = clean_text(
+            &remove_wrong_chars(get_str(value, 2, T, "middle_name")?),
+            Some(AUTHOR_NAME_MAX),
+            T,
+            "middle_name",
+            id,
+        );
 
         Ok(Author {
             id,
@@ -208,86 +361,46 @@ pub struct Book {
 
 impl FromVecExpression<Book> for Book {
     fn from_vec_expression(value: &[Expression]) -> Result<Book, ParseError> {
-        let id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let title = match &value[3] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "title",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let lang = match &value[5] {
-            sql_parse::Expression::String(v) => parse_lang(&v.value),
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "lang",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let file_type = match &value[8] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "file_type",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let uploaded = match &value[2] {
-            sql_parse::Expression::String(v) => parse_book_date(&v.value),
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "uploaded",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let is_deleted = match &value[11] {
-            sql_parse::Expression::String(v) => v.value.eq("1"),
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "is_deleted",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let pages = match &value[20] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "pages",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let year = match &value[10] {
-            sql_parse::Expression::Integer(v) => v.0,
-            sql_parse::Expression::Unary { .. } => 0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Book",
-                    field: "year",
-                    detail: format!("{:?}", other),
-                })
-            }
+        const T: &str = "Book";
+        let id = get_int(value, 0, T, "id")?;
+        let title = clean_text(
+            &remove_wrong_chars(get_str(value, 3, T, "title")?),
+            Some(BOOK_TITLE_MAX),
+            T,
+            "title",
+            id,
+        );
+        let lang = check_len(
+            clean_text(
+                &parse_lang(get_str(value, 5, T, "lang")?),
+                None,
+                T,
+                "lang",
+                id,
+            ),
+            BOOK_LANG_MAX,
+            T,
+            "lang",
+        )?;
+        let file_type = check_len(
+            clean_text(
+                &unescape_mysql_string(get_str(value, 8, T, "file_type")?),
+                None,
+                T,
+                "file_type",
+                id,
+            ),
+            BOOK_FILE_TYPE_MAX,
+            T,
+            "file_type",
+        )?;
+        let uploaded = parse_book_date(get_str(value, 2, T, "uploaded")?);
+        let is_deleted = get_str(value, 11, T, "is_deleted")?.eq("1");
+        let pages = get_int(value, 20, T, "pages")?;
+        let year = match get(value, 10, T, "year")? {
+            Expression::Integer(v) => v.0,
+            Expression::Unary { .. } => 0,
+            other => return Err(unexpected(T, "year", other)),
         };
 
         Ok(Book {
@@ -355,28 +468,11 @@ pub struct BookAuthor {
 
 impl FromVecExpression<BookAuthor> for BookAuthor {
     fn from_vec_expression(value: &[Expression]) -> Result<BookAuthor, ParseError> {
-        let book_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAuthor",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let author_id = match &value[1] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAuthor",
-                    field: "author_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-
-        Ok(BookAuthor { book_id, author_id })
+        const T: &str = "BookAuthor";
+        Ok(BookAuthor {
+            book_id: get_int(value, 0, T, "book_id")?,
+            author_id: get_int(value, 1, T, "author_id")?,
+        })
     }
 }
 
@@ -404,41 +500,11 @@ pub struct Translator {
 
 impl FromVecExpression<Translator> for Translator {
     fn from_vec_expression(value: &[Expression]) -> Result<Translator, ParseError> {
-        let book_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Translator",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let author_id = match &value[1] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Translator",
-                    field: "author_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let position = match &value[2] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Translator",
-                    field: "position",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-
+        const T: &str = "Translator";
         Ok(Translator {
-            book_id,
-            author_id,
-            position,
+            book_id: get_int(value, 0, T, "book_id")?,
+            author_id: get_int(value, 1, T, "author_id")?,
+            position: get_int(value, 2, T, "position")?,
         })
     }
 }
@@ -471,26 +537,15 @@ pub struct Sequence {
 
 impl FromVecExpression<Sequence> for Sequence {
     fn from_vec_expression(value: &[Expression]) -> Result<Sequence, ParseError> {
-        let id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Sequence",
-                    field: "id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let name = match &value[1] {
-            sql_parse::Expression::String(v) => remove_wrong_chars(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Sequence",
-                    field: "name",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "Sequence";
+        let id = get_int(value, 0, T, "id")?;
+        let name = clean_text(
+            &remove_wrong_chars(get_str(value, 1, T, "name")?),
+            Some(SEQUENCE_NAME_MAX),
+            T,
+            "name",
+            id,
+        );
 
         Ok(Sequence { id, name })
     }
@@ -519,49 +574,20 @@ pub struct SequenceInfo {
 
 impl FromVecExpression<SequenceInfo> for SequenceInfo {
     fn from_vec_expression(value: &[Expression]) -> Result<SequenceInfo, ParseError> {
-        let book_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "SequenceInfo",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let sequence_id = match &value[1] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "SequenceInfo",
-                    field: "sequence_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let position = match &value[2] {
-            sql_parse::Expression::Integer(v) => v.0,
-            sql_parse::Expression::Unary {
+        const T: &str = "SequenceInfo";
+        let book_id = get_int(value, 0, T, "book_id")?;
+        let sequence_id = get_int(value, 1, T, "sequence_id")?;
+        let position = match get(value, 2, T, "position")? {
+            Expression::Integer(v) => v.0,
+            Expression::Unary {
                 op,
                 op_span: _,
                 operand,
             } => match (op, operand.as_ref()) {
                 (sql_parse::UnaryOperator::Minus, Expression::Integer(v)) => v.0,
-                (_, _) => {
-                    return Err(ParseError {
-                        type_name: "SequenceInfo",
-                        field: "position",
-                        detail: format!("{:?}", value[2]),
-                    })
-                }
+                (_, _) => return Err(unexpected(T, "position", &value[2])),
             },
-            other => {
-                return Err(ParseError {
-                    type_name: "SequenceInfo",
-                    field: "position",
-                    detail: format!("{:?}", other),
-                })
-            }
+            other => return Err(unexpected(T, "position", other)),
         };
 
         Ok(SequenceInfo {
@@ -601,37 +627,17 @@ pub struct BookAnnotation {
 
 impl FromVecExpression<BookAnnotation> for BookAnnotation {
     fn from_vec_expression(value: &[Expression]) -> Result<BookAnnotation, ParseError> {
-        let book_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAnnotation",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let title = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAnnotation",
-                    field: "title",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let body = match &value[3] {
-            sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
-            sql_parse::Expression::Null(_) => None,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAnnotation",
-                    field: "body",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "BookAnnotation";
+        let book_id = get_int(value, 0, T, "book_id")?;
+        let title = clean_text(
+            &unescape_mysql_string(get_str(value, 2, T, "title")?),
+            Some(ANNOTATION_TITLE_MAX),
+            T,
+            "title",
+            book_id,
+        );
+        let body = get_opt_str(value, 3, T, "body")?
+            .map(|s| clean_text(&fix_annotation_text(s), None, T, "body", book_id));
 
         Ok(BookAnnotation {
             book_id,
@@ -667,26 +673,15 @@ pub struct BookAnnotationPic {
 
 impl FromVecExpression<BookAnnotationPic> for BookAnnotationPic {
     fn from_vec_expression(value: &[Expression]) -> Result<BookAnnotationPic, ParseError> {
-        let book_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAnnotationPic",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let file = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "BookAnnotationPic",
-                    field: "file",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "BookAnnotationPic";
+        let book_id = get_int(value, 0, T, "book_id")?;
+        let file = clean_text(
+            &unescape_mysql_string(get_str(value, 2, T, "file")?),
+            Some(ANNOTATION_FILE_MAX),
+            T,
+            "file",
+            book_id,
+        );
 
         Ok(BookAnnotationPic { book_id, file })
     }
@@ -715,37 +710,17 @@ pub struct AuthorAnnotation {
 
 impl FromVecExpression<AuthorAnnotation> for AuthorAnnotation {
     fn from_vec_expression(value: &[Expression]) -> Result<AuthorAnnotation, ParseError> {
-        let author_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "AuthorAnnotation",
-                    field: "author_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let title = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "AuthorAnnotation",
-                    field: "title",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let body = match &value[3] {
-            sql_parse::Expression::String(v) => Some(fix_annotation_text(&v.value)),
-            sql_parse::Expression::Null(_) => None,
-            other => {
-                return Err(ParseError {
-                    type_name: "AuthorAnnotation",
-                    field: "body",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "AuthorAnnotation";
+        let author_id = get_int(value, 0, T, "author_id")?;
+        let title = clean_text(
+            &unescape_mysql_string(get_str(value, 2, T, "title")?),
+            Some(ANNOTATION_TITLE_MAX),
+            T,
+            "title",
+            author_id,
+        );
+        let body = get_opt_str(value, 3, T, "body")?
+            .map(|s| clean_text(&fix_annotation_text(s), None, T, "body", author_id));
 
         Ok(AuthorAnnotation {
             author_id,
@@ -781,26 +756,15 @@ pub struct AuthorAnnotationPic {
 
 impl FromVecExpression<AuthorAnnotationPic> for AuthorAnnotationPic {
     fn from_vec_expression(value: &[Expression]) -> Result<AuthorAnnotationPic, ParseError> {
-        let author_id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "AuthorAnnotationPic",
-                    field: "author_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let file = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "AuthorAnnotationPic",
-                    field: "file",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "AuthorAnnotationPic";
+        let author_id = get_int(value, 0, T, "author_id")?;
+        let file = clean_text(
+            &unescape_mysql_string(get_str(value, 2, T, "file")?),
+            Some(ANNOTATION_FILE_MAX),
+            T,
+            "file",
+            author_id,
+        );
 
         Ok(AuthorAnnotationPic { author_id, file })
     }
@@ -830,46 +794,29 @@ pub struct Genre {
 
 impl FromVecExpression<Genre> for Genre {
     fn from_vec_expression(value: &[Expression]) -> Result<Genre, ParseError> {
-        let id = match &value[0] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "Genre",
-                    field: "id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let code = match &value[1] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Genre",
-                    field: "code",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let description = match &value[2] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Genre",
-                    field: "description",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let meta = match &value[3] {
-            sql_parse::Expression::String(v) => unescape_mysql_string(&v.value).into_owned(),
-            other => {
-                return Err(ParseError {
-                    type_name: "Genre",
-                    field: "meta",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
+        const T: &str = "Genre";
+        let id = get_int(value, 0, T, "id")?;
+        let code = clean_text(
+            &unescape_mysql_string(get_str(value, 1, T, "code")?),
+            Some(GENRE_CODE_MAX),
+            T,
+            "code",
+            id,
+        );
+        let description = clean_text(
+            &unescape_mysql_string(get_str(value, 2, T, "description")?),
+            Some(GENRE_DESCRIPTION_MAX),
+            T,
+            "description",
+            id,
+        );
+        let meta = clean_text(
+            &unescape_mysql_string(get_str(value, 3, T, "meta")?),
+            Some(GENRE_META_MAX),
+            T,
+            "meta",
+            id,
+        );
 
         Ok(Genre {
             id,
@@ -907,28 +854,11 @@ pub struct BookGenre {
 
 impl FromVecExpression<BookGenre> for BookGenre {
     fn from_vec_expression(value: &[Expression]) -> Result<BookGenre, ParseError> {
-        let book_id = match &value[1] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookGenre",
-                    field: "book_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-        let genre_id = match &value[2] {
-            sql_parse::Expression::Integer(v) => v.0,
-            other => {
-                return Err(ParseError {
-                    type_name: "BookGenre",
-                    field: "genre_id",
-                    detail: format!("{:?}", other),
-                })
-            }
-        };
-
-        Ok(BookGenre { book_id, genre_id })
+        const T: &str = "BookGenre";
+        Ok(BookGenre {
+            book_id: get_int(value, 1, T, "book_id")?,
+            genre_id: get_int(value, 2, T, "genre_id")?,
+        })
     }
 }
 
@@ -950,7 +880,7 @@ impl Staged for BookGenre {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::updater::parse_insert_values;
+    use crate::updater::{parse_insert_values, parse_line, LineOutcome};
 
     #[test]
     fn parse_book_date_falls_back_on_zero_date() {
@@ -1003,20 +933,163 @@ mod tests {
     }
 
     #[test]
-    fn author_edge_case_escaped_newline_and_null_middle_name_folded() {
-        // Note: `sql_parse` 0.9's MariaDB-dialect string lexer has a known
-        // off-by-one quirk specifically for backslash-escaped *single
-        // quotes* (`\'`) that drops the character immediately following the
-        // escape - a pre-existing crate issue orthogonal to
-        // `unescape_mysql_string`, so fixtures here deliberately exercise
-        // other MySQL escapes (`\n`, `\"`, `\\`) which round-trip correctly
-        // through the crate instead.
-        let row = first_row("INSERT INTO `libavtorname` VALUES (2,'Conan','','O\\nBrien');");
-        let author = Author::from_vec_expression(&row).unwrap();
+    fn author_edge_case_escaped_newline_folded() {
+        let a = one::<Author>("INSERT INTO `libavtorname` VALUES (2,'Conan','','O\\nBrien');");
         assert_eq!(
-            author.last_name, "O Brien",
+            a.last_name, "O Brien",
             "unescaped literal newline must be folded to a space by remove_wrong_chars"
         );
+    }
+
+    // -- end-to-end: raw INSERT line -> final field value ---------------------
+
+    /// Parses a full `INSERT` line through the production path
+    /// (`parse_line`: normalization + sql_parse + `from_vec_expression`) and
+    /// returns the single resulting entity.
+    fn one<T: FromVecExpression<T> + std::fmt::Debug>(line: &str) -> T {
+        match parse_line::<T>(line) {
+            LineOutcome::Rows(mut rows) => {
+                assert_eq!(rows.len(), 1, "expected exactly one row for {line}");
+                rows.remove(0).unwrap_or_else(|e| panic!("{e} for {line}"))
+            }
+            other => panic!("unexpected outcome {other:?} for {line}"),
+        }
+    }
+
+    fn last_name(sql_literal: &str) -> String {
+        one::<Author>(&format!(
+            "INSERT INTO `libavtorname` VALUES (1,'F','M',{sql_literal});"
+        ))
+        .last_name
+    }
+
+    #[test]
+    fn e2e_escaped_single_quote_keeps_following_char() {
+        assert_eq!(last_name(r"'O\'Brien'"), "O'Brien");
+        assert_eq!(last_name(r"'Д\'Артаньян'"), "Д'Артаньян");
+        assert_eq!(last_name(r"'Can\'t'"), "Can't");
+    }
+
+    #[test]
+    fn e2e_backslash_before_closing_quote() {
+        // `'a\\'` is the literal `a\` (one backslash) - quote is NOT escaped.
+        assert_eq!(last_name(r"'a\\'"), "a\\");
+        // ...and the rest of the row/line still parses.
+        let rows = match parse_line::<Author>(
+            r"INSERT INTO `libavtorname` VALUES (1,'F','M','a\\'),(2,'G','N','b');",
+        ) {
+            LineOutcome::Rows(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].as_ref().unwrap().last_name, "b");
+    }
+
+    #[test]
+    fn e2e_escaped_backslash_then_escaped_quote() {
+        // literal: a\\\'b -> a, backslash, quote, b
+        assert_eq!(last_name(r"'a\\\'b'"), "a\\'b");
+    }
+
+    #[test]
+    fn e2e_doubled_quote() {
+        assert_eq!(last_name("'It''s'"), "It's");
+    }
+
+    #[test]
+    fn e2e_other_escapes() {
+        assert_eq!(last_name(r"'a\tb'"), "a\tb");
+        assert_eq!(last_name(r"'a\\b'"), "a\\b");
+        assert_eq!(last_name(r#"'say \"hi\"'"#), "say \"hi\"");
+        assert_eq!(last_name(r"'a\0b'"), "ab", "NUL must be stripped");
+    }
+
+    #[test]
+    fn e2e_quote_inside_double_quoted_literal_and_neighbours() {
+        // Neighbouring rows are unaffected by an escaped quote in the first.
+        let rows = match parse_line::<Author>(
+            r"INSERT INTO `libavtorname` VALUES (1,'A','B','O\'Neil'),(2,'C','D','Smith');",
+        ) {
+            LineOutcome::Rows(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rows[0].as_ref().unwrap().last_name, "O'Neil");
+        assert_eq!(rows[1].as_ref().unwrap().last_name, "Smith");
+    }
+
+    #[test]
+    fn short_row_is_an_error_not_a_panic() {
+        match parse_line::<Book>("INSERT INTO `libbook` VALUES (1,2,3);") {
+            LineOutcome::Rows(rows) => {
+                let err = rows.into_iter().next().unwrap().unwrap_err();
+                assert_eq!(err.type_name, "Book");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_line::<Genre>("INSERT INTO `libgenrelist` VALUES (1);") {
+            LineOutcome::Rows(rows) => assert!(rows[0].is_err()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hex_literal_does_not_panic() {
+        match parse_line::<Author>("INSERT INTO `libavtorname` VALUES (1,'F','M',X'4142');") {
+            LineOutcome::Rows(rows) => assert!(rows[0].is_err()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_insert_lines_are_not_failures() {
+        for l in ["", "LOCK TABLES `x` WRITE;", "UNLOCK TABLES;", "-- comment"] {
+            assert!(
+                matches!(parse_line::<Author>(l), LineOutcome::NotInsert),
+                "{l}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_insert_is_a_failure() {
+        assert!(matches!(
+            parse_line::<Author>("INSERT INTO `x` VALUES (1, 'unterminated"),
+            LineOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn long_title_is_truncated_by_chars() {
+        let title = "Я".repeat(300);
+        let line = format!(
+            "INSERT INTO `libbook` VALUES (5,0,'2020-01-01 12:00:00','{title}',0,'ru',0,0,'fb2',0,2020,'0',0,0,0,0,0,0,0,0,150);"
+        );
+        let book = one::<Book>(&line);
+        assert_eq!(book.title.chars().count(), 256);
+    }
+
+    #[test]
+    fn invalid_lang_or_file_type_skips_row() {
+        let mk = |lang: &str, ft: &str| {
+            format!(
+                "INSERT INTO `libbook` VALUES (5,0,'2020-01-01 12:00:00','T',0,'{lang}',0,0,'{ft}',0,2020,'0',0,0,0,0,0,0,0,0,150);"
+            )
+        };
+        for line in [mk("abcd", "fb2"), mk("ru", "fb2xx")] {
+            match parse_line::<Book>(&line) {
+                LineOutcome::Rows(rows) => assert!(rows[0].is_err(), "{line}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn long_genre_description_truncated() {
+        let d = "ж".repeat(150);
+        let g = one::<Genre>(&format!(
+            "INSERT INTO `libgenrelist` VALUES (1,'c','{d}','m');"
+        ));
+        assert_eq!(g.description.chars().count(), 99);
     }
 
     // -- Book -------------------------------------------------------------

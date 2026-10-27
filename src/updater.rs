@@ -35,6 +35,12 @@ lazy_static! {
         .connect_timeout(Duration::from_secs(
             config::CONFIG.download_connect_timeout_secs
         ))
+        // Applies to every read (including waiting for response headers), so
+        // a server that accepts the connection but never answers can't hang
+        // the run.
+        .read_timeout(Duration::from_secs(
+            config::CONFIG.download_idle_timeout_secs
+        ))
         .build()
         .expect("failed to build download http client");
 }
@@ -125,11 +131,43 @@ async fn download_attempt(
     Ok(())
 }
 
+/// Downloads `url` like [`download_file_with_client_inner`], but under a hard
+/// overall `total` deadline covering all attempts and backoff sleeps. On
+/// timeout the `.part` file is removed.
+async fn download_file_with_client(
+    client: &reqwest::Client,
+    url: &str,
+    dest_dir: &Path,
+    file_name: &str,
+    idle: Duration,
+    max_attempts: u32,
+    total: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match tokio::time::timeout(
+        total,
+        download_file_with_client_inner(client, url, dest_dir, file_name, idle, max_attempts),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let part_path = dest_dir.join(format!("{file_name}.part"));
+            if let Err(rm_err) = tokio::fs::remove_file(&part_path).await {
+                log::debug!("Can't remove part file: {:?}", rm_err);
+            }
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("download of {file_name} exceeded the overall deadline of {total:?}"),
+            )))
+        }
+    }
+}
+
 /// Downloads `url` into `<dest_dir>/<file_name>.part`, retrying up to
 /// `max_attempts` times with exponential backoff, and only renames the part
 /// file to `<dest_dir>/<file_name>` on full success. Any failure at any
 /// point during an attempt deletes the `.part` file before retrying/failing.
-async fn download_file_with_client(
+async fn download_file_with_client_inner(
     client: &reqwest::Client,
     url: &str,
     dest_dir: &Path,
@@ -204,6 +242,7 @@ async fn download_file(
         file_name,
         Duration::from_secs(config::CONFIG.download_idle_timeout_secs),
         config::CONFIG.download_max_attempts,
+        Duration::from_secs(config::CONFIG.download_total_timeout_secs),
     )
     .await
 }
@@ -252,25 +291,167 @@ where
     result
 }
 
-/// Parse a single line from a Flibusta MySQL dump into the list of
-/// value-rows found in its `INSERT` statement. Returns an empty `Vec` for
-/// any line that isn't a recognized `INSERT` (blank lines, `LOCK TABLES`
-/// statements, comments, a genuine parse failure, etc.) - not an error,
-/// since dump files routinely contain such non-`INSERT` lines interleaved
-/// with the data rows.
+/// Rewrites a dump line so `sql_parse` 0.28 decodes its string literals
+/// correctly.
 ///
-/// Pure and I/O-free (no DB, no filesystem): this is the "parse line ->
-/// entities" step, kept deliberately separate from the `COPY`/IO loop in
-/// `stage_file_inner` so it can be unit-tested directly, including from
-/// `crate::types`'s `FromVecExpression` fixture tests.
+/// `sql_parse` drops the character following a `\'` inside a single-quoted
+/// literal (`'O\'Brien'` -> `O'rien`). Inside single-quoted literals this
+/// converts `\'` to the equivalent `''` (respecting `\\`, so `'a\\'` stays a
+/// complete literal). All other escapes are left for
+/// `crate::utils::unescape_mysql_string`. Hex literals (`X'..'`) outside
+/// strings, which make the lexer panic, are replaced with `NULL` so the
+/// containing row is rejected by field validation instead.
+pub fn normalize_mysql_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\\') && !line.contains(['x', 'X']) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+
+    #[derive(PartialEq)]
+    enum St {
+        Outside,
+        Single,
+        Double,
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut state = St::Outside;
+    let mut prev: Option<char> = None;
+    let mut changed = false;
+
+    while let Some(c) = chars.next() {
+        match state {
+            St::Outside => match c {
+                '\'' => {
+                    state = St::Single;
+                    out.push(c);
+                }
+                '"' => {
+                    state = St::Double;
+                    out.push(c);
+                }
+                'x' | 'X'
+                    if chars.peek() == Some(&'\'')
+                        && !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') =>
+                {
+                    chars.next();
+                    for h in chars.by_ref() {
+                        if h == '\'' {
+                            break;
+                        }
+                    }
+                    out.push_str("NULL");
+                    changed = true;
+                }
+                _ => out.push(c),
+            },
+            St::Single => match c {
+                '\\' => match chars.next() {
+                    Some('\'') => {
+                        out.push_str("''");
+                        changed = true;
+                    }
+                    Some(n) => {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                    None => out.push('\\'),
+                },
+                '\'' => {
+                    out.push(c);
+                    if chars.peek() == Some(&'\'') {
+                        out.push('\'');
+                        chars.next();
+                    } else {
+                        state = St::Outside;
+                    }
+                }
+                _ => out.push(c),
+            },
+            St::Double => match c {
+                '\\' => {
+                    out.push(c);
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                }
+                '"' => {
+                    out.push(c);
+                    if chars.peek() == Some(&'"') {
+                        out.push('"');
+                        chars.next();
+                    } else {
+                        state = St::Outside;
+                    }
+                }
+                _ => out.push(c),
+            },
+        }
+        prev = Some(c);
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
+/// Parse a single (already normalized, see [`normalize_mysql_line`]) line
+/// from a Flibusta MySQL dump into the list of value-rows found in its
+/// `INSERT` statement. Returns an empty `Vec` for anything that isn't a
+/// recognized `INSERT`. Use [`parse_line`] in production code: it also
+/// normalizes the line and distinguishes non-`INSERT` lines from failed
+/// `INSERT`s.
 pub fn parse_insert_values(line: &str) -> Vec<Vec<Expression<'_>>> {
+    parse_insert_values_checked(line).unwrap_or_default()
+}
+
+/// Like [`parse_insert_values`], but `Err(detail)` if the line looks like an
+/// `INSERT` and could not be parsed (syntax errors, or a lexer panic), and
+/// `Ok(vec![])` for non-`INSERT` lines.
+fn parse_insert_values_checked(line: &str) -> Result<Vec<Vec<Expression<'_>>>, String> {
     let parse_options = ParseOptions::new()
         .dialect(SQLDialect::MariaDB)
         .arguments(SQLArguments::QuestionMark)
         .warn_unquoted_identifiers(true);
 
-    let mut issues = Issues::new(line);
-    let ast = parse_statement(line, &mut issues, &parse_options);
+    let looks_like_insert = line
+        .trim_start()
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("insert"));
+
+    // sql_parse can panic on exotic input; treat that as a failed line.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut issues = Issues::new(line);
+        let ast = parse_statement(line, &mut issues, &parse_options);
+        let first_error = issues
+            .get()
+            .iter()
+            // The trailing `;` of a dump line is reported by sql_parse as
+            // "Unexpected token after statement"; that's expected.
+            .find(|i| {
+                i.level == sql_parse::Level::Error
+                    && !i.message.contains("Unexpected token after statement")
+                    && !i
+                        .fragments
+                        .iter()
+                        .any(|f| f.message.contains("Unexpected token after statement"))
+            })
+            .map(|i| i.message.to_string());
+        (ast, first_error)
+    }));
+
+    let (ast, first_error) = match parsed {
+        Ok(v) => v,
+        Err(_) => {
+            return if looks_like_insert {
+                Err("SQL parser panicked".to_string())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    };
 
     match ast {
         Some(Statement::InsertReplace(
@@ -278,18 +459,54 @@ pub fn parse_insert_values(line: &str) -> Vec<Vec<Expression<'_>>> {
                 type_: InsertReplaceType::Insert(_),
                 ..
             },
-        )) => i.values.into_iter().flat_map(|v| v.1).collect(),
-        _ => Vec::new(),
+        )) => {
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+            Ok(i.values.into_iter().flat_map(|v| v.1).collect())
+        }
+        _ if looks_like_insert => Err(first_error.unwrap_or_else(|| "unparseable INSERT".into())),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Result of parsing one dump line into entities of type `T`.
+#[derive(Debug)]
+pub enum LineOutcome<T> {
+    /// Not an `INSERT` (blank line, `LOCK TABLES`, comment, ...): ignored.
+    NotInsert,
+    /// An `INSERT` statement that could not be parsed at all.
+    /// `estimated_rows` approximates how many rows were lost.
+    Failed { estimated_rows: u64, detail: String },
+    /// One result per `VALUES (...)` row.
+    Rows(Vec<Result<T, crate::types::ParseError>>),
+}
+
+/// Full "dump line -> entities" step: normalizes the line, parses it and
+/// converts each row into `T`. Pure and I/O-free so it can be tested
+/// end-to-end from a raw `INSERT ... VALUES (...)` line to field values.
+pub fn parse_line<T: FromVecExpression<T>>(line: &str) -> LineOutcome<T> {
+    let normalized = normalize_mysql_line(line);
+    match parse_insert_values_checked(&normalized) {
+        Err(detail) => LineOutcome::Failed {
+            estimated_rows: normalized.matches("),(").count() as u64 + 1,
+            detail,
+        },
+        // Non-INSERT line (or an INSERT without VALUES): nothing to stage.
+        Ok(rows) if rows.is_empty() => LineOutcome::NotInsert,
+        Ok(rows) => LineOutcome::Rows(rows.iter().map(|r| T::from_vec_expression(r)).collect()),
     }
 }
 
 /// One parsed-and-converted outcome flowing from the blocking parse worker
 /// to the async COPY writer in `stage_file_inner`. `Row` carries data ready
 /// to bind to the COPY sink; `Skipped` carries a human-readable reason for
-/// a row that failed to parse or convert (bounded logging, see 14.4).
+/// a row that failed to parse or convert; `FailedLine` is an `INSERT` line
+/// that could not be parsed at all (an estimated number of rows lost).
 enum ParsedItem {
     Row(Vec<crate::types::Val>),
     Skipped(String),
+    FailedLine { estimated_rows: u64, detail: String },
 }
 
 /// Bounded channel capacity between the blocking parse worker and the async
@@ -297,9 +514,8 @@ enum ParsedItem {
 /// don't pile up in RAM ahead of a slow writer (Spec 14.2).
 const PARSE_CHANNEL_CAPACITY: usize = 1024;
 
-/// Cap on how many per-row skip failures get logged at ERROR (with detail)
-/// per file; beyond this, only a final count is logged (Spec 14.4 — avoids
-/// unbounded multi-KB log lines on a systematically bad dump).
+/// Cap on how many per-row skip failures get logged (at WARN, with detail)
+/// per file; beyond this, only the final summary counts them.
 const MAX_LOGGED_SKIPS_PER_FILE: u64 = 20;
 
 async fn stage_file_inner<T>(
@@ -335,8 +551,11 @@ where
 
     let producer_file_name = file_name.to_string();
     let producer_handle = tokio::task::spawn_blocking(
-        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        move || -> Result<crate::types::RowCounters, Box<dyn std::error::Error + Send + Sync>> {
             let file_name = producer_file_name;
+
+            // Blocking threads are pooled: drop counters left by a previous file.
+            crate::types::take_row_counters();
 
             for (line_no, line) in (1_u64..).zip(lines) {
                 let line = line.map_err(|err| {
@@ -346,44 +565,44 @@ where
                     )) as Box<dyn std::error::Error + Send + Sync>
                 })?;
 
-                for t_value in parse_insert_values(&line) {
-                    let value = match T::from_vec_expression(&t_value) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            if tx
-                                .blocking_send(ParsedItem::Skipped(format!("{:?}", e)))
-                                .is_err()
-                            {
-                                return Ok(());
-                            }
-                            continue;
+                let results = match parse_line::<T>(&line) {
+                    LineOutcome::NotInsert => continue,
+                    LineOutcome::Failed {
+                        estimated_rows,
+                        detail,
+                    } => {
+                        let detail = format!("line {line_no}: {detail}");
+                        if tx
+                            .blocking_send(ParsedItem::FailedLine {
+                                estimated_rows,
+                                detail,
+                            })
+                            .is_err()
+                        {
+                            return Ok(crate::types::take_row_counters());
                         }
-                    };
+                        continue;
+                    }
+                    LineOutcome::Rows(results) => results,
+                };
 
-                    let row = match value.to_row() {
-                        Ok(row) => row,
-                        Err(e) => {
-                            if tx
-                                .blocking_send(ParsedItem::Skipped(format!("{:?}", e)))
-                                .is_err()
-                            {
-                                return Ok(());
-                            }
-                            continue;
-                        }
+                for result in results {
+                    let item = match result.and_then(|value| value.to_row()) {
+                        Ok(row) => ParsedItem::Row(row),
+                        Err(e) => ParsedItem::Skipped(format!("line {line_no}: {e}")),
                     };
-
-                    if tx.blocking_send(ParsedItem::Row(row)).is_err() {
-                        return Ok(());
+                    if tx.blocking_send(item).is_err() {
+                        return Ok(crate::types::take_row_counters());
                     }
                 }
             }
 
-            Ok(())
+            Ok(crate::types::take_row_counters())
         },
     );
 
     let mut skipped: u64 = 0;
+    let mut failed_lines: u64 = 0;
     let mut logged: u64 = 0;
 
     while let Some(item) = rx.recv().await {
@@ -397,28 +616,55 @@ where
             ParsedItem::Skipped(detail) => {
                 skipped += 1;
                 if logged < MAX_LOGGED_SKIPS_PER_FILE {
-                    log::error!("Parse error in {file_name}: {detail}");
+                    log::warn!("{file_name}: skipped row: {detail}");
+                    logged += 1;
+                }
+            }
+            ParsedItem::FailedLine {
+                estimated_rows,
+                detail,
+            } => {
+                skipped += estimated_rows;
+                failed_lines += 1;
+                if logged < MAX_LOGGED_SKIPS_PER_FILE {
+                    log::warn!(
+                        "{file_name}: failed INSERT (~{estimated_rows} row(s) lost): {detail}"
+                    );
                     logged += 1;
                 }
             }
         }
     }
 
-    if skipped > logged {
-        log::error!(
-            "{file_name}: ... and {} more skipped rows",
-            skipped - logged
-        );
-    }
-
-    match producer_handle.await {
+    let counters = match producer_handle.await {
         Ok(result) => result?,
         Err(join_err) => {
             return Err(Box::new(std::io::Error::other(join_err.to_string())));
         }
-    }
+    };
 
     let staged = writer.finish().await?;
+
+    if counters.zero_dates > 0 {
+        log::info!(
+            "{file_name}: {} row(s) had a 0000-00-00 date (replaced with 1970-01-01)",
+            counters.zero_dates
+        );
+    }
+    if counters.truncated > 0 || counters.bad_dates > 0 {
+        log::warn!(
+            "{file_name}: {} value(s) truncated to column length, {} unparseable date(s) replaced",
+            counters.truncated,
+            counters.bad_dates
+        );
+    }
+
+    if skipped > 0 {
+        log::error!(
+            "{file_name}: {skipped} row(s) skipped ({failed_lines} unparseable INSERT line(s)); \
+             only the first {MAX_LOGGED_SKIPS_PER_FILE} were logged individually"
+        );
+    }
 
     log::info!(
         "{file_name} summary: staged={staged} skipped={skipped} duration={:.2}s",
@@ -507,12 +753,35 @@ pub async fn check_staging_ratio(
     label: &str,
     min_ratio: f64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_staging_ratio_sql(
+        client,
+        &format!("SELECT COUNT(*) FROM {staging_table}"),
+        &[],
+        target_count_sql,
+        &[&source_id],
+        label,
+        min_ratio,
+    )
+    .await
+}
+
+/// Like [`check_staging_ratio`], but with an explicit staged-count query so
+/// the staged side can use the same filter/dedup as the target side.
+pub async fn check_staging_ratio_sql(
+    client: &Client,
+    staged_count_sql: &str,
+    staged_params: &[&(dyn ToSql + Sync)],
+    target_count_sql: &str,
+    target_params: &[&(dyn ToSql + Sync)],
+    label: &str,
+    min_ratio: f64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let staged: i64 = client
-        .query_one(&format!("SELECT COUNT(*) FROM {staging_table}"), &[])
+        .query_one(staged_count_sql, staged_params)
         .await?
         .get(0);
     let target: i64 = client
-        .query_one(target_count_sql, &[&source_id])
+        .query_one(target_count_sql, target_params)
         .await?
         .get(0);
 
@@ -541,57 +810,82 @@ pub async fn sanity_check(
     let client = pool.get().await?;
     let min_ratio = config::CONFIG.min_staging_ratio;
 
-    check_staging_ratio(
+    // Books: the target side counts non-deleted books in the configured
+    // languages (the books the merge keeps live), so count the staged side
+    // with the same filter, deduplicated by key (the merge upserts one row
+    // per remote_id).
+    check_staging_ratio_sql(
         &client,
-        "staging_books",
-        "SELECT COUNT(*) FROM books WHERE source = $1 AND NOT is_deleted",
-        source_id,
+        "SELECT COUNT(DISTINCT remote_id) FROM staging_books \
+         WHERE NOT is_deleted AND lang = ANY($1::text[])",
+        &[&config::CONFIG.allowed_langs],
+        "SELECT COUNT(*) FROM books WHERE source = $1 AND NOT is_deleted AND lang = ANY($2::text[])",
+        &[&source_id, &config::CONFIG.allowed_langs],
         "books",
         min_ratio,
     )
     .await?;
 
-    check_staging_ratio(
-        &client,
-        "staging_book_authors",
-        "SELECT COUNT(*) FROM book_authors ba JOIN books b ON b.id = ba.book WHERE b.source = $1",
-        source_id,
-        "book_authors",
-        min_ratio,
-    )
-    .await?;
+    let link_checks: [(&str, &str, &str); 4] = [
+        (
+            "book_authors",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT book_remote_id, author_remote_id FROM staging_book_authors) d",
+            "SELECT COUNT(*) FROM book_authors ba JOIN books b ON b.id = ba.book WHERE b.source = $1",
+        ),
+        (
+            "book_genres",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT book_remote_id, genre_remote_id FROM staging_book_genres) d",
+            "SELECT COUNT(*) FROM book_genres bg JOIN books b ON b.id = bg.book WHERE b.source = $1",
+        ),
+        (
+            "translations",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT book_remote_id, author_remote_id FROM staging_translations) d",
+            "SELECT COUNT(*) FROM translations t JOIN books b ON b.id = t.book WHERE b.source = $1",
+        ),
+        (
+            "book_sequences",
+            "SELECT COUNT(*) FROM (SELECT DISTINCT book_remote_id, sequence_remote_id FROM staging_book_sequences) d",
+            "SELECT COUNT(*) FROM book_sequences bs JOIN books b ON b.id = bs.book WHERE b.source = $1",
+        ),
+    ];
 
-    check_staging_ratio(
-        &client,
-        "staging_book_genres",
-        "SELECT COUNT(*) FROM book_genres bg JOIN books b ON b.id = bg.book WHERE b.source = $1",
-        source_id,
-        "book_genres",
-        min_ratio,
-    )
-    .await?;
-
-    check_staging_ratio(
-        &client,
-        "staging_translations",
-        "SELECT COUNT(*) FROM translations t JOIN books b ON b.id = t.book WHERE b.source = $1",
-        source_id,
-        "translations",
-        min_ratio,
-    )
-    .await?;
-
-    check_staging_ratio(
-        &client,
-        "staging_book_sequences",
-        "SELECT COUNT(*) FROM book_sequences bs JOIN books b ON b.id = bs.book WHERE b.source = $1",
-        source_id,
-        "book_sequences",
-        min_ratio,
-    )
-    .await?;
+    for (label, staged_sql, target_sql) in link_checks {
+        check_staging_ratio_sql(
+            &client,
+            staged_sql,
+            &[],
+            target_sql,
+            &[&source_id],
+            label,
+            min_ratio,
+        )
+        .await?;
+    }
 
     Ok(())
+}
+
+/// Returns one failure message per dump file whose
+/// `skipped / (staged + skipped)` exceeds `max_ratio`. A high skip ratio means
+/// the dump format changed or the data is corrupted: better to fail the run
+/// than to silently merge a fraction of the catalog.
+fn check_skipped_ratio(outcomes: &[StageOutcome], max_ratio: f64) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (file_name, result) in outcomes {
+        if let Ok(stats) = result {
+            let total = stats.staged + stats.skipped;
+            if stats.skipped > 0 && total > 0 {
+                let ratio = stats.skipped as f64 / total as f64;
+                if ratio > max_ratio {
+                    failures.push(format!(
+                        "{file_name}: skipped {} of {total} rows (ratio {ratio:.4} > max_skipped_ratio={max_ratio})",
+                        stats.skipped
+                    ));
+                }
+            }
+        }
+    }
+    failures
 }
 
 /// Aggregates the per-file Phase A outcomes (after `JoinHandle`s have
@@ -702,14 +996,8 @@ async fn load_and_merge(
         }
     }
 
-    for (file_name, result) in &outcomes {
+    for (_, result) in &outcomes {
         match result {
-            Ok(stats) if stats.skipped > 0 => {
-                log::warn!(
-                    "{file_name}: {} row(s) skipped while staging",
-                    stats.skipped
-                );
-            }
             Ok(_) => (),
             Err(_) => {
                 RUN_STATE.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -717,7 +1005,9 @@ async fn load_and_merge(
         }
     }
 
-    let (stats, failures) = aggregate_stage_outcomes(outcomes);
+    let mut skipped_failures = check_skipped_ratio(&outcomes, config::CONFIG.max_skipped_ratio);
+    let (stats, mut failures) = aggregate_stage_outcomes(outcomes);
+    failures.append(&mut skipped_failures);
 
     RUN_STATE
         .rows_processed_total
@@ -830,12 +1120,21 @@ async fn send_webhooks() -> Result<(), String> {
 
             let response = builder.headers(request_headers).send().await;
 
-            let attempt_result = match response {
-                Ok(v) => match v.error_for_status() {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(err.to_string()),
-                },
-                Err(err) => Err(err.to_string()),
+            // (error text, retryable). Only network errors and 5xx (and
+            // 408/429) are retried; other 4xx are permanent.
+            let attempt_result: Result<(), (String, bool)> = match response {
+                Ok(v) => {
+                    let status = v.status();
+                    if status.is_success() {
+                        Ok(())
+                    } else {
+                        let retryable = status.is_server_error()
+                            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                        Err((format!("HTTP status {status}"), retryable))
+                    }
+                }
+                Err(err) => Err((err.without_url().to_string(), true)),
             };
 
             match attempt_result {
@@ -843,8 +1142,11 @@ async fn send_webhooks() -> Result<(), String> {
                     last_error = None;
                     break;
                 }
-                Err(err) => {
+                Err((err, retryable)) => {
                     last_error = Some(err);
+                    if !retryable {
+                        break;
+                    }
                     if attempt < WEBHOOK_MAX_ATTEMPTS - 1 {
                         let backoff_ms = WEBHOOK_RETRY_BACKOFFS_MS[attempt as usize];
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -1276,9 +1578,16 @@ mod tests {
         let url = format!("{base_url}/dump.sql.gz");
 
         let client = reqwest::Client::new();
-        let result =
-            download_file_with_client(&client, &url, &dir, file_name, Duration::from_secs(5), 1)
-                .await;
+        let result = download_file_with_client(
+            &client,
+            &url,
+            &dir,
+            file_name,
+            Duration::from_secs(5),
+            1,
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(result.is_err(), "expected truncated download to fail");
 
@@ -1314,7 +1623,16 @@ mod tests {
         let idle = Duration::from_millis(200);
 
         let start = std::time::Instant::now();
-        let result = download_file_with_client(&client, &url, &dir, file_name, idle, 1).await;
+        let result = download_file_with_client(
+            &client,
+            &url,
+            &dir,
+            file_name,
+            idle,
+            1,
+            Duration::from_secs(30),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "expected stalled download to fail");
@@ -1359,6 +1677,50 @@ mod tests {
     #[test]
     fn parse_insert_values_returns_empty_for_malformed_line() {
         assert!(parse_insert_values("INSERT INTO `x` VALUES (1, 'unterminated").is_empty());
+    }
+
+    #[test]
+    fn normalize_converts_escaped_quotes_but_respects_escaped_backslash() {
+        assert_eq!(
+            normalize_mysql_line(r"VALUES ('O\'Brien')"),
+            r"VALUES ('O''Brien')"
+        );
+        assert_eq!(normalize_mysql_line(r"VALUES ('a\\')"), r"VALUES ('a\\')");
+        assert_eq!(
+            normalize_mysql_line(r"VALUES ('a\\\'b')"),
+            r"VALUES ('a\\''b')"
+        );
+        assert_eq!(normalize_mysql_line("VALUES ('plain')"), "VALUES ('plain')");
+    }
+
+    #[test]
+    fn skipped_ratio_gate() {
+        let outcomes: Vec<StageOutcome> = vec![
+            (
+                "ok",
+                Ok(StageStats {
+                    staged: 1000,
+                    skipped: 5,
+                }),
+            ),
+            (
+                "bad",
+                Ok(StageStats {
+                    staged: 90,
+                    skipped: 10,
+                }),
+            ),
+            (
+                "empty",
+                Ok(StageStats {
+                    staged: 0,
+                    skipped: 0,
+                }),
+            ),
+        ];
+        let failures = check_skipped_ratio(&outcomes, 0.01);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].starts_with("bad"));
     }
 
     // --- aggregate_stage_outcomes ---

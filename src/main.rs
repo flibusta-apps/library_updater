@@ -14,27 +14,60 @@ use std::{net::SocketAddr, str::FromStr};
 use tower_http::trace::{self, TraceLayer};
 use tracing::log;
 use tracing::Level;
-use tracing_subscriber::filter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 async fn health() -> &'static str {
     "OK"
 }
 
-async fn status() -> axum::Json<serde_json::Value> {
-    let snap = updater::RUN_STATE.snapshot();
+/// Returns true if the `Authorization` header matches `expected_api_key`
+/// (constant-time compare; invalid header bytes are simply "not authorized").
+fn is_authorized(headers: &HeaderMap, expected_api_key: &str) -> bool {
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| constant_time_eq(expected_api_key.as_bytes(), v.as_bytes()))
+}
+
+/// Public `/status` omits free-form error text (it can contain internal
+/// hostnames, SQL details, webhook URLs); callers presenting the API key get
+/// the full text.
+async fn status(headers: HeaderMap) -> axum::Json<serde_json::Value> {
+    status_json(
+        &updater::RUN_STATE.snapshot(),
+        is_authorized(&headers, &config::CONFIG.api_key),
+    )
+}
+
+fn status_json(snap: &updater::StatusSnapshot, authorized: bool) -> axum::Json<serde_json::Value> {
+    let last_result = if authorized {
+        snap.last_result.clone()
+    } else {
+        // Sanitized: only success/failure.
+        snap.last_result
+            .as_ref()
+            .map(|r| if r == "success" { "success" } else { "failed" }.to_string())
+    };
+    let last_webhook_error = if authorized {
+        snap.last_webhook_error.clone()
+    } else {
+        snap.last_webhook_error
+            .as_ref()
+            .map(|_| "failed".to_string())
+    };
     axum::Json(serde_json::json!({
         "running": snap.running,
         "last_start": snap.last_start,
         "last_finish": snap.last_finish,
         "last_success_at": snap.last_success_at,
-        "last_result": snap.last_result,
+        "last_result": last_result,
         "rows_processed_total": snap.rows_processed_total,
         "rows_skipped_total": snap.rows_skipped_total,
         "errors_total": snap.errors_total,
         "webhook_errors_total": snap.webhook_errors_total,
-        "last_webhook_error": snap.last_webhook_error,
+        "last_webhook_error": last_webhook_error,
     }))
 }
 
@@ -169,20 +202,27 @@ async fn main() {
         _ => EventFilter::Ignore,
     });
 
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(filter::LevelFilter::INFO)
+        .with(env_filter)
         .with(sentry_layer)
         .init();
 
-    let cron_task = async {
-        match cron_jobs().await {
-            Ok(_) => {}
-            Err(err) => log::error!("cron_jobs failed to start: {:?}", err),
+    // The scheduler is essential (it is the only trigger of nightly
+    // updates): if it can't start, exit so the orchestrator restarts us
+    // instead of silently running without updates.
+    if let Err(err) = cron_jobs().await {
+        log::error!("cron_jobs failed to start: {:?}", err);
+        sentry::capture_error(err.as_ref());
+        if let Some(client) = sentry::Hub::current().client() {
+            client.flush(Some(std::time::Duration::from_secs(2)));
         }
-    };
+        std::process::exit(1);
+    }
 
-    tokio::join![cron_task, start_app()];
+    start_app().await;
 }
 
 #[cfg(test)]
