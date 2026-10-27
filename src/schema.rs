@@ -2,8 +2,8 @@
 //! pipeline (spec 01). Every statement here is `IF NOT EXISTS`/additive and
 //! safe to run on every process start.
 //!
-//! Notes on the additive `CREATE UNIQUE INDEX IF NOT EXISTS` statements
-//! below: the previous row-by-row updater always checked `EXISTS(...)`
+//! Notes on the additive unique-index bootstrap below (only created when an
+//! equivalent unique index/constraint doesn't already exist): the previous row-by-row updater always checked `EXISTS(...)`
 //! before inserting into `sequences`, `book_sequences`, `translations`,
 //! `book_annotations` and `author_annotations`, so no duplicate rows should
 //! exist in production for the columns we index here. If that assumption
@@ -83,17 +83,46 @@ CREATE UNLOGGED TABLE IF NOT EXISTS staging_author_annotation_pics (
 );
 ";
 
-/// Additive unique indexes required by the `ON CONFLICT` clauses in
-/// `crate::merge::MERGE_PLAN`, for tables where the old row-by-row updater
-/// never relied on (and therefore may never have created) a real unique
-/// constraint.
-const ENSURE_UNIQUE_INDEXES_SQL: &str = "
-CREATE UNIQUE INDEX IF NOT EXISTS ux_sequences_source_remote_id ON sequences (source, remote_id);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_book_sequences_book_sequence ON book_sequences (book, sequence);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_translations_book_author ON translations (book, author);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_book_annotations_book ON book_annotations (book);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_author_annotations_author ON author_annotations (author);
-";
+/// Unique indexes required by the `ON CONFLICT` clauses in
+/// `crate::merge::MERGE_PLAN`. `book_library_server`'s migrations already
+/// create equivalent unique constraints (`uc_sequences_source_remote_id`,
+/// `uc_book_sequences_book_sequence`, `uc_translations_book_author`, and
+/// `UNIQUE` on `book_annotations.book` / `author_annotations.author`), so an
+/// extra index is only created when no equivalent plain unique index (same
+/// columns, same order) exists yet, e.g. on a database that wasn't built by
+/// those migrations. This avoids duplicate unique indexes (double write
+/// cost/space).
+const ENSURE_UNIQUE_INDEXES_SQL: &str = r#"
+DO $$
+DECLARE r record;
+BEGIN
+    FOR r IN
+        SELECT * FROM (VALUES
+            ('sequences', 'source,remote_id', 'ux_sequences_source_remote_id'),
+            ('book_sequences', 'book,sequence', 'ux_book_sequences_book_sequence'),
+            ('translations', 'book,author', 'ux_translations_book_author'),
+            ('book_annotations', 'book', 'ux_book_annotations_book'),
+            ('author_annotations', 'author', 'ux_author_annotations_author')
+        ) AS t(tbl, cols, idx)
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_index i
+            WHERE i.indrelid = to_regclass(r.tbl)
+              AND i.indisunique
+              AND i.indpred IS NULL
+              AND i.indexprs IS NULL
+              AND (
+                  SELECT string_agg(a.attname::text, ',' ORDER BY k.ord)
+                  FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+              ) = r.cols
+        ) THEN
+            EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %I (%s)', r.idx, r.tbl, r.cols);
+        END IF;
+    END LOOP;
+END $$;
+"#;
 
 /// One `TRUNCATE` per staging table, run at the start of every load so a
 /// previous (possibly partial) run's rows never leak into a fresh merge.
