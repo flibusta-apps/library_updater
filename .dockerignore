@@ -1,0 +1,10 @@
+target
+.git
+.github
+.env*
+data
+*.sql
+*.sql.gz
+*.gz
+.vscode
+bruno
