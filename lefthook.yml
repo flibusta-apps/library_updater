@@ -6,7 +6,7 @@ pre-commit:
   parallel: true
   jobs:
     - name: gitleaks
-      run: gitleaks dir --source . --verbose --exit-code 1
+      run: gitleaks dir . --redact --verbose --exit-code 1
 
     - name: cargo fmt
       run: cargo fmt --all --check

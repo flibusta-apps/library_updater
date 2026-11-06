@@ -103,6 +103,10 @@ pub struct Config {
     /// than queue checkouts silently, which would otherwise look like a
     /// stall rather than a config problem.
     pub postgres_pool_wait_timeout_secs: u64,
+    /// Session defaults for all updater connections (including Phase A/DDL).
+    /// Phase B uses its own transaction-local limits.
+    pub postgres_statement_timeout_secs: u64,
+    pub postgres_lock_timeout_secs: u64,
     /// Minimum ratio of (rows staged this run) / (non-deleted rows currently
     /// in the DB for this source) required to proceed to the merge
     /// transaction. Guards against a truncated/partial upstream dump
@@ -110,7 +114,8 @@ pub struct Config {
     /// steps. Skipped when the DB-side count is 0 (first run for a source).
     pub min_staging_ratio: f64,
     /// Maximum tolerated ratio `skipped / (staged + skipped)` per dump file.
-    /// Above it the run fails before the merge transaction.
+    /// Above it the run fails before the merge transaction. Independently,
+    /// any skipped row now blocks merging to prevent destructive anti-joins.
     pub max_skipped_ratio: f64,
     /// `work_mem` used for the Phase B merge transaction (`SET LOCAL
     /// work_mem = ...`). The merge plan does several hash joins/aggregates
@@ -241,6 +246,14 @@ impl Config {
                 get_env_or("POSTGRES_POOL_WAIT_TIMEOUT_SECS", 10),
             ),
             min_staging_ratio: validate_min_staging_ratio(get_env_or("MIN_STAGING_RATIO", 0.5)),
+            postgres_statement_timeout_secs: require_positive(
+                "POSTGRES_STATEMENT_TIMEOUT_SECS",
+                get_env_or("POSTGRES_STATEMENT_TIMEOUT_SECS", 1800),
+            ),
+            postgres_lock_timeout_secs: require_positive(
+                "POSTGRES_LOCK_TIMEOUT_SECS",
+                get_env_or("POSTGRES_LOCK_TIMEOUT_SECS", 30),
+            ),
             max_skipped_ratio: validate_max_skipped_ratio(get_env_or("MAX_SKIPPED_RATIO", 0.01)),
             merge_work_mem: get_env_or("MERGE_WORK_MEM", "256MB".to_string()),
         }

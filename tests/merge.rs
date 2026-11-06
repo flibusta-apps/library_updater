@@ -287,6 +287,17 @@ async fn authors_upsert_inserts_updates_and_skips_noop_writes() {
         .unwrap();
     let first_name: String = row.get(0);
     assert_eq!(first_name, "Jane");
+
+    // Updates and no-op reimports must not advance a SERIAL sequence.
+    run_merge_plan(&mut client, SOURCE_ID, &langs)
+        .await
+        .unwrap();
+    let last_id: i64 = client
+        .query_one("SELECT last_value FROM authors_id_seq", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(last_id, 1, "existing rows must not consume sequence values");
 }
 
 #[tokio::test]

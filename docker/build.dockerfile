@@ -1,5 +1,5 @@
-FROM rust:bookworm AS chef
-RUN cargo install cargo-chef
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS chef
+RUN cargo install cargo-chef --version 0.1.77 --locked
 WORKDIR /app
 
 FROM chef AS planner
@@ -10,13 +10,13 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Builds and caches just the dependencies as their own layer, so this step is
 # skipped by the Docker/buildx cache whenever only application source changes.
-RUN cargo chef cook --release --recipe-path recipe.json --bin library_updater
+RUN cargo chef cook --release --locked --recipe-path recipe.json --bin library_updater
 
 COPY . .
-RUN cargo build --release --bin library_updater
+RUN cargo build --release --locked --bin library_updater
 
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update \
     && apt-get install -y openssl ca-certificates curl \

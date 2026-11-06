@@ -42,82 +42,111 @@ pub static MERGE_PLAN: &[MergeStep] = &[
     MergeStep {
         name: "authors upsert",
         sql: "
-            INSERT INTO authors (source, remote_id, first_name, last_name, middle_name)
-            SELECT $1, s.remote_id, s.first_name, s.last_name, s.middle_name
-            FROM (
+            WITH s AS MATERIALIZED (
                 SELECT DISTINCT ON (remote_id) *
                 FROM staging_authors
                 WHERE remote_id IS NOT NULL
                 ORDER BY remote_id, ctid DESC
-            ) s
-            ON CONFLICT (source, remote_id) DO UPDATE
-            SET first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                middle_name = EXCLUDED.middle_name
-            WHERE (authors.first_name, authors.last_name, authors.middle_name)
-                IS DISTINCT FROM (EXCLUDED.first_name, EXCLUDED.last_name, EXCLUDED.middle_name);
+            ), updated AS (
+                UPDATE authors t
+                SET first_name = s.first_name,
+                    last_name = s.last_name,
+                    middle_name = s.middle_name
+                FROM s
+                WHERE t.source = $1 AND t.remote_id = s.remote_id
+                  AND (t.first_name, t.last_name, t.middle_name) IS DISTINCT FROM (s.first_name, s.last_name, s.middle_name)
+            )
+            INSERT INTO authors (source, remote_id, first_name, last_name, middle_name)
+            SELECT $1, s.remote_id, s.first_name, s.last_name, s.middle_name
+            FROM s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM authors t WHERE t.source = $1 AND t.remote_id = s.remote_id
+            )
+            ON CONFLICT (source, remote_id) DO NOTHING;
         ",
         params: Params::Source,
     },
     MergeStep {
         name: "books upsert",
         sql: "
-            INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages, year)
-            SELECT $1, s.remote_id, s.title, s.lang, s.file_type, s.uploaded,
-                   s.is_deleted OR NOT (s.lang = ANY($2::text[])), s.pages, s.year
-            FROM (
-                SELECT DISTINCT ON (remote_id) *
+            WITH s AS MATERIALIZED (
+                SELECT DISTINCT ON (remote_id) remote_id, title, lang, file_type, uploaded,
+                       is_deleted OR NOT (lang = ANY($2::text[])) AS is_deleted, pages, year
                 FROM staging_books
                 WHERE remote_id IS NOT NULL
                 ORDER BY remote_id, ctid DESC
-            ) s
-            ON CONFLICT (source, remote_id) DO UPDATE
-            SET title = EXCLUDED.title,
-                lang = EXCLUDED.lang,
-                file_type = EXCLUDED.file_type,
-                uploaded = EXCLUDED.uploaded,
-                is_deleted = EXCLUDED.is_deleted,
-                pages = EXCLUDED.pages,
-                year = EXCLUDED.year
-            WHERE (books.title, books.lang, books.file_type, books.uploaded, books.is_deleted, books.pages, books.year)
-                IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.lang, EXCLUDED.file_type, EXCLUDED.uploaded, EXCLUDED.is_deleted, EXCLUDED.pages, EXCLUDED.year);
+            ), updated AS (
+                UPDATE books t
+                SET title = s.title,
+                    lang = s.lang,
+                    file_type = s.file_type,
+                    uploaded = s.uploaded,
+                    is_deleted = s.is_deleted,
+                    pages = s.pages,
+                    year = s.year
+                FROM s
+                WHERE t.source = $1 AND t.remote_id = s.remote_id
+                  AND (t.title, t.lang, t.file_type, t.uploaded, t.is_deleted, t.pages, t.year) IS DISTINCT FROM (s.title, s.lang, s.file_type, s.uploaded, s.is_deleted, s.pages, s.year)
+            )
+            INSERT INTO books (source, remote_id, title, lang, file_type, uploaded, is_deleted, pages, year)
+            SELECT $1, s.remote_id, s.title, s.lang, s.file_type, s.uploaded, s.is_deleted, s.pages, s.year
+            FROM s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM books t WHERE t.source = $1 AND t.remote_id = s.remote_id
+            )
+            ON CONFLICT (source, remote_id) DO NOTHING;
         ",
         params: Params::SourceLangs,
     },
     MergeStep {
         name: "genres upsert",
         sql: "
-            INSERT INTO genres (source, remote_id, code, description, meta)
-            SELECT $1, s.remote_id, s.code, s.description, s.meta
-            FROM (
+            WITH s AS MATERIALIZED (
                 SELECT DISTINCT ON (remote_id) *
                 FROM staging_genres
                 WHERE remote_id IS NOT NULL
                 ORDER BY remote_id, ctid DESC
-            ) s
-            ON CONFLICT (source, remote_id) DO UPDATE
-            SET code = EXCLUDED.code,
-                description = EXCLUDED.description,
-                meta = EXCLUDED.meta
-            WHERE (genres.code, genres.description, genres.meta)
-                IS DISTINCT FROM (EXCLUDED.code, EXCLUDED.description, EXCLUDED.meta);
+            ), updated AS (
+                UPDATE genres t
+                SET code = s.code,
+                    description = s.description,
+                    meta = s.meta
+                FROM s
+                WHERE t.source = $1 AND t.remote_id = s.remote_id
+                  AND (t.code, t.description, t.meta) IS DISTINCT FROM (s.code, s.description, s.meta)
+            )
+            INSERT INTO genres (source, remote_id, code, description, meta)
+            SELECT $1, s.remote_id, s.code, s.description, s.meta
+            FROM s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM genres t WHERE t.source = $1 AND t.remote_id = s.remote_id
+            )
+            ON CONFLICT (source, remote_id) DO NOTHING;
         ",
         params: Params::Source,
     },
     MergeStep {
         name: "sequences upsert",
         sql: "
-            INSERT INTO sequences (source, remote_id, name)
-            SELECT $1, s.remote_id, s.name
-            FROM (
+            WITH s AS MATERIALIZED (
                 SELECT DISTINCT ON (remote_id) *
                 FROM staging_sequences
                 WHERE remote_id IS NOT NULL
                 ORDER BY remote_id, ctid DESC
-            ) s
-            ON CONFLICT (source, remote_id) DO UPDATE
-            SET name = EXCLUDED.name
-            WHERE sequences.name IS DISTINCT FROM EXCLUDED.name;
+            ), updated AS (
+                UPDATE sequences t
+                SET name = s.name
+                FROM s
+                WHERE t.source = $1 AND t.remote_id = s.remote_id
+                  AND (t.name) IS DISTINCT FROM (s.name)
+            )
+            INSERT INTO sequences (source, remote_id, name)
+            SELECT $1, s.remote_id, s.name
+            FROM s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM sequences t WHERE t.source = $1 AND t.remote_id = s.remote_id
+            )
+            ON CONFLICT (source, remote_id) DO NOTHING;
         ",
         params: Params::Source,
     },
@@ -205,11 +234,18 @@ pub static MERGE_PLAN: &[MergeStep] = &[
     MergeStep {
         name: "translations upsert",
         sql: "
+            WITH updated AS (
+                UPDATE translations t SET position = s.position
+                FROM d_translations s
+                WHERE t.book = s.book AND t.author = s.author
+                  AND t.position IS DISTINCT FROM s.position
+            )
             INSERT INTO translations (book, author, position)
-            SELECT book, author, position FROM d_translations
-            ON CONFLICT (book, author) DO UPDATE
-            SET position = EXCLUDED.position
-            WHERE translations.position IS DISTINCT FROM EXCLUDED.position;
+            SELECT s.book, s.author, s.position FROM d_translations s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM translations t WHERE t.book = s.book AND t.author = s.author
+            )
+            ON CONFLICT (book, author) DO NOTHING;
         ",
         params: Params::None,
     },
@@ -240,11 +276,18 @@ pub static MERGE_PLAN: &[MergeStep] = &[
         // as-is; fixing it is out of scope for this spec.
         name: "book_sequences upsert",
         sql: "
+            WITH updated AS (
+                UPDATE book_sequences t SET position = ABS(s.position)
+                FROM d_book_sequences s
+                WHERE t.book = s.book AND t.sequence = s.sequence
+                  AND t.position IS DISTINCT FROM ABS(s.position)
+            )
             INSERT INTO book_sequences (book, sequence, position)
-            SELECT book, sequence, ABS(position) FROM d_book_sequences
-            ON CONFLICT (book, sequence) DO UPDATE
-            SET position = EXCLUDED.position
-            WHERE book_sequences.position IS DISTINCT FROM EXCLUDED.position;
+            SELECT s.book, s.sequence, ABS(s.position) FROM d_book_sequences s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM book_sequences t WHERE t.book = s.book AND t.sequence = s.sequence
+            )
+            ON CONFLICT (book, sequence) DO NOTHING;
         ",
         params: Params::None,
     },
@@ -252,19 +295,27 @@ pub static MERGE_PLAN: &[MergeStep] = &[
     MergeStep {
         name: "book_annotations upsert",
         sql: "
+            WITH resolved AS MATERIALIZED (
+                SELECT b.id AS book, s.title, s.text
+                FROM (
+                    SELECT DISTINCT ON (book_remote_id) *
+                    FROM staging_book_annotations
+                    WHERE book_remote_id IS NOT NULL AND text IS NOT NULL
+                    ORDER BY book_remote_id, ctid DESC
+                ) s
+                JOIN books b ON b.source = $1 AND b.remote_id = s.book_remote_id
+            ), updated AS (
+                UPDATE book_annotations t SET title = s.title, text = s.text
+                FROM resolved s
+                WHERE t.book = s.book
+                  AND (t.title, t.text) IS DISTINCT FROM (s.title, s.text)
+            )
             INSERT INTO book_annotations (book, title, text)
-            SELECT b.id, s.title, s.text
-            FROM (
-                SELECT DISTINCT ON (book_remote_id) *
-                FROM staging_book_annotations
-                WHERE book_remote_id IS NOT NULL AND text IS NOT NULL
-                ORDER BY book_remote_id, ctid DESC
-            ) s
-            JOIN books b ON b.source = $1 AND b.remote_id = s.book_remote_id
-            ON CONFLICT (book) DO UPDATE
-            SET title = EXCLUDED.title, text = EXCLUDED.text
-            WHERE (book_annotations.title, book_annotations.text)
-                IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.text);
+            SELECT s.book, s.title, s.text FROM resolved s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM book_annotations t WHERE t.book = s.book
+            )
+            ON CONFLICT (book) DO NOTHING;
         ",
         params: Params::Source,
     },
@@ -290,19 +341,27 @@ pub static MERGE_PLAN: &[MergeStep] = &[
     MergeStep {
         name: "author_annotations upsert",
         sql: "
+            WITH resolved AS MATERIALIZED (
+                SELECT a.id AS author, s.title, s.text
+                FROM (
+                    SELECT DISTINCT ON (author_remote_id) *
+                    FROM staging_author_annotations
+                    WHERE author_remote_id IS NOT NULL AND text IS NOT NULL
+                    ORDER BY author_remote_id, ctid DESC
+                ) s
+                JOIN authors a ON a.source = $1 AND a.remote_id = s.author_remote_id
+            ), updated AS (
+                UPDATE author_annotations t SET title = s.title, text = s.text
+                FROM resolved s
+                WHERE t.author = s.author
+                  AND (t.title, t.text) IS DISTINCT FROM (s.title, s.text)
+            )
             INSERT INTO author_annotations (author, title, text)
-            SELECT a.id, s.title, s.text
-            FROM (
-                SELECT DISTINCT ON (author_remote_id) *
-                FROM staging_author_annotations
-                WHERE author_remote_id IS NOT NULL AND text IS NOT NULL
-                ORDER BY author_remote_id, ctid DESC
-            ) s
-            JOIN authors a ON a.source = $1 AND a.remote_id = s.author_remote_id
-            ON CONFLICT (author) DO UPDATE
-            SET title = EXCLUDED.title, text = EXCLUDED.text
-            WHERE (author_annotations.title, author_annotations.text)
-                IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.text);
+            SELECT s.author, s.title, s.text FROM resolved s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM author_annotations t WHERE t.author = s.author
+            )
+            ON CONFLICT (author) DO NOTHING;
         ",
         params: Params::Source,
     },

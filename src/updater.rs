@@ -110,7 +110,8 @@ async fn download_attempt(
     });
 
     let data = counted_stream.into_async_read();
-    let decoder = GzipDecoder::new(data);
+    let mut decoder = GzipDecoder::new(data);
+    decoder.multiple_members(true);
 
     match copy(decoder, &mut file).await {
         Ok(_) => (),
@@ -411,6 +412,9 @@ pub fn parse_insert_values(line: &str) -> Vec<Vec<Expression<'_>>> {
 /// `INSERT` and could not be parsed (syntax errors, or a lexer panic), and
 /// `Ok(vec![])` for non-`INSERT` lines.
 fn parse_insert_values_checked(line: &str) -> Result<Vec<Vec<Expression<'_>>>, String> {
+    // Remove only harmless terminators, not arbitrary tokens after the first
+    // statement. Any remaining parser error must reject the entire line.
+    let line = line.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
     let parse_options = ParseOptions::new()
         .dialect(SQLDialect::MariaDB)
         .arguments(SQLArguments::QuestionMark)
@@ -428,16 +432,7 @@ fn parse_insert_values_checked(line: &str) -> Result<Vec<Vec<Expression<'_>>>, S
         let first_error = issues
             .get()
             .iter()
-            // The trailing `;` of a dump line is reported by sql_parse as
-            // "Unexpected token after statement"; that's expected.
-            .find(|i| {
-                i.level == sql_parse::Level::Error
-                    && !i.message.contains("Unexpected token after statement")
-                    && !i
-                        .fragments
-                        .iter()
-                        .any(|f| f.message.contains("Unexpected token after statement"))
-            })
+            .find(|i| i.level == sql_parse::Level::Error)
             .map(|i| i.message.to_string());
         (ast, first_error)
     }));
@@ -711,6 +706,13 @@ async fn get_postgres_pool() -> Result<Pool, CreatePoolError> {
     config.user = Some(config::CONFIG.postgres_user.clone());
     config.password = Some(config::CONFIG.postgres_password.clone());
     config.connect_timeout = Some(std::time::Duration::from_secs(5));
+    // Startup options apply to every connection, including bootstrap DDL,
+    // TRUNCATE, COPY and sanity checks. Phase B overrides them transactionally.
+    config.options = Some(format!(
+        "-c statement_timeout={}s -c lock_timeout={}s",
+        config::CONFIG.postgres_statement_timeout_secs,
+        config::CONFIG.postgres_lock_timeout_secs,
+    ));
     config.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Verified,
     });
@@ -888,6 +890,22 @@ fn check_skipped_ratio(outcomes: &[StageOutcome], max_ratio: f64) -> Vec<String>
     failures
 }
 
+/// An incomplete dump must never drive destructive anti-joins. Abort before
+/// Phase B rather than threading per-table deletion flags through the SQL plan.
+/// This also protects links whose entity-id resolution depends on another dump.
+fn check_merge_completeness(outcomes: &[StageOutcome]) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter_map(|(file, result)| match result {
+            Ok(stats) if stats.skipped > 0 => Some(format!(
+                "{file}: {} skipped row(s); aborting merge to preserve existing data",
+                stats.skipped
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Aggregates the per-file Phase A outcomes (after `JoinHandle`s have
 /// already been awaited) into total `StageStats` and a list of failure
 /// messages, one per failed file. Pure and I/O-free, so the orchestration
@@ -1006,6 +1024,7 @@ async fn load_and_merge(
     }
 
     let mut skipped_failures = check_skipped_ratio(&outcomes, config::CONFIG.max_skipped_ratio);
+    skipped_failures.extend(check_merge_completeness(&outcomes));
     let (stats, mut failures) = aggregate_stage_outcomes(outcomes);
     failures.append(&mut skipped_failures);
 
@@ -1541,6 +1560,35 @@ mod tests {
         out
     }
 
+    #[tokio::test]
+    async fn download_reads_concatenated_gzip_members() {
+        let mut compressed = gzip_compress(b"first statement\n").await;
+        compressed.extend(gzip_compress(b"second statement\n").await);
+        let router = Router::new().route(
+            "/dump.gz",
+            get(move || {
+                let body = compressed.clone();
+                async move { body }
+            }),
+        );
+        let base = spawn_server(router).await;
+        let dir = temp_dir("multiple_members");
+        let path = dir.join("dump.sql.part");
+        download_attempt(
+            &reqwest::Client::new(),
+            &format!("{base}/dump.gz"),
+            &path,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"first statement\nsecond statement\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1657,6 +1705,51 @@ mod tests {
         let rows = parse_insert_values(line);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 4);
+    }
+
+    #[test]
+    fn multiple_statements_fail_the_entire_line() {
+        let line = "INSERT INTO `libavtorname` VALUES (1,'John','','Doe'); INSERT INTO `libavtorname` VALUES (2,'Jane','','Roe');";
+        assert!(matches!(
+            parse_line::<Author>(line),
+            LineOutcome::Failed {
+                estimated_rows: 1..,
+                ..
+            }
+        ));
+        assert!(parse_insert_values_checked(
+            "INSERT INTO `libavtorname` VALUES (1,'John; Junior','','Doe'); ; \n"
+        )
+        .is_ok());
+        assert!(parse_insert_values_checked(
+            "INSERT INTO `libavtorname` VALUES (1,'John','','Doe'); garbage"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn even_one_skipped_row_blocks_merge_regardless_of_ratio() {
+        let outcomes: Vec<StageOutcome> = vec![
+            (
+                "books",
+                Ok(StageStats {
+                    staged: 1_000_000,
+                    skipped: 1,
+                }),
+            ),
+            (
+                "authors",
+                Ok(StageStats {
+                    staged: 1000,
+                    skipped: 0,
+                }),
+            ),
+        ];
+        assert!(check_skipped_ratio(&outcomes, 1.0).is_empty());
+        let failures = check_merge_completeness(&outcomes);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].starts_with("books:"));
+        assert!(check_merge_completeness(&[]).is_empty());
     }
 
     #[test]
