@@ -9,7 +9,6 @@ use library_updater::{
     updater::{self, cron_jobs},
 };
 use sentry::{integrations::debug_images::DebugImagesIntegration, types::Dsn, ClientOptions};
-use sentry_tracing::EventFilter;
 use std::{net::SocketAddr, str::FromStr};
 use tower_http::trace::{self, TraceLayer};
 use tracing::log;
@@ -17,6 +16,8 @@ use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+
+mod observability;
 
 async fn health() -> &'static str {
     "OK"
@@ -185,29 +186,23 @@ async fn start_app() {
 async fn main() {
     dotenv().ok();
 
-    let options = ClientOptions {
-        dsn: Some(
-            Dsn::from_str(&config::CONFIG.sentry_dsn)
-                .unwrap_or_else(|e| panic!("Invalid SENTRY_DSN env variable: {e}")),
-        ),
-        default_integrations: true,
-        ..Default::default()
-    }
-    .add_integration(DebugImagesIntegration::new());
+    let mut options = ClientOptions::default();
+    options.dsn = Some(
+        Dsn::from_str(&config::CONFIG.sentry_dsn)
+            .unwrap_or_else(|e| panic!("Invalid SENTRY_DSN env variable: {e}")),
+    );
+    options.default_integrations = true;
+    let options = options.add_integration(DebugImagesIntegration::new());
 
     let _guard = sentry::init(options);
-
-    let sentry_layer = sentry_tracing::layer().event_filter(|md| match md.level() {
-        &tracing::Level::ERROR => EventFilter::Event,
-        _ => EventFilter::Ignore,
-    });
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .with(env_filter)
-        .with(sentry_layer)
+        .with(observability::sentry_span_layer())
+        .with(observability::sentry_error_layer())
         .init();
 
     // The scheduler is essential (it is the only trigger of nightly
