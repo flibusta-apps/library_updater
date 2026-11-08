@@ -28,7 +28,7 @@ bytes = "1.11.1"
 reqwest = { version = "0.13.5", features = ["stream"] }
 tokio-util = { version = "0.7.14", features = ["compat"] }
 async-compression = { version = "0.4.21", features = ["futures-io", "gzip"] }
-sentry = { version = "0.47.0", features = ["debug-images"] }
+sentry = { version = "0.49.5", features = ["debug-images"] }
 lazy_static = "1.5.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -39,11 +39,12 @@ maplit = "1.0.2"
 
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"]}
-sentry-tracing = "0.47.0"
+sentry-tracing = "0.49.5"
 
 tower-http = { version = "0.7.0", features = ["trace"] }
 dotenvy = "0.15.0"
 
 [dev-dependencies]
+sentry = { version = "0.49.5", features = ["test"] }
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
